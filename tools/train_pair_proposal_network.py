@@ -61,11 +61,18 @@ def parse_args():
     parser.add_argument("--ranking-loss-weight", type=float, default=0.2)
     parser.add_argument("--ranking-margin", type=float, default=0.2)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional reproducibility seed; omitted by default.",
+    )
     return parser.parse_args()
 
 
-def seed_everything(seed: int) -> None:
+def seed_everything(seed: int | None) -> None:
+    if seed is None:
+        return
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

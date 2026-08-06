@@ -29,6 +29,7 @@ from sgg.modeling.detectors.class_channel_order import (
     reorder_detector_classifier_rows,
 )
 from sgg.modeling.detectors.scene_graph_detector import SceneGraphDetector
+from sgg.utils.reproducibility import save_run_manifest
 
 
 def apply_runtime_cfg(cfg):
@@ -101,7 +102,152 @@ def parse_args():
         default=-1,
         help="Optional deterministic prefix limit for smoke evaluation.",
     )
+    parser.add_argument(
+        "--image-ids",
+        type=str,
+        default="",
+        help="Optional comma-separated source image IDs. The dataset is restricted before loading.",
+    )
+    parser.add_argument(
+        "--artifact-output-dir",
+        type=str,
+        default="",
+        help="Optional directory for per-image prediction/target .pt artifacts.",
+    )
     return parser.parse_args()
+
+
+def _parse_image_ids(value: str) -> list[int]:
+    if not str(value).strip():
+        return []
+    image_ids = []
+    seen = set()
+    for token in str(value).split(","):
+        image_id = int(token.strip())
+        if image_id < 0:
+            raise ValueError(f"image IDs must be non-negative, got {image_id}")
+        if image_id not in seen:
+            image_ids.append(image_id)
+            seen.add(image_id)
+    return image_ids
+
+
+def _restrict_dataset_to_image_ids(dataset, image_ids: list[int]) -> None:
+    if not image_ids:
+        return
+    records = getattr(dataset, "records", None)
+    if records is None:
+        raise TypeError("--image-ids requires a dataset exposing source records")
+    selected = {}
+    for record in records:
+        image_id = int(record.get("_source_image_id", record.get("image_index", -1)))
+        if image_id in image_ids and image_id not in selected:
+            selected[image_id] = record
+    missing = [image_id for image_id in image_ids if image_id not in selected]
+    if missing:
+        raise ValueError(f"Requested image IDs are not present in this split: {missing}")
+    dataset.records = [selected[image_id] for image_id in image_ids]
+    print(f"Restricted {dataset.split} dataset to image_ids={image_ids}", flush=True)
+
+
+def _boxlist_tensor(boxlist, field: str, *, default=None):
+    if boxlist.has_field(field):
+        value = boxlist.get_field(field)
+        if torch.is_tensor(value):
+            return value.detach().cpu()
+        return value
+    return default
+
+
+def _serialize_case_boxlist(boxlist, fields: tuple[str, ...]) -> dict:
+    payload = {
+        "bbox": boxlist.bbox.detach().cpu(),
+        "size": tuple(int(v) for v in boxlist.size),
+        "mode": str(boxlist.mode),
+    }
+    for field in fields:
+        value = _boxlist_tensor(boxlist, field)
+        if value is not None:
+            payload[field] = value
+    return payload
+
+
+def _write_case_artifacts(
+    artifact_output_dir: Path,
+    artifacts: dict,
+    *,
+    cfg: dict,
+    split: str,
+    filter_method: str,
+) -> None:
+    artifact_output_dir.mkdir(parents=True, exist_ok=True)
+    prediction_fields = (
+        "labels",
+        "pred_labels",
+        "pred_scores",
+        "scores",
+        "predict_logits",
+        "filter_labels",
+        "rel_pair_idxs",
+        "pred_rel_scores",
+        "pred_rel_labels",
+        "base_rel_pair_idxs",
+        "sema_rel_pair_idxs",
+        "final_rel_pair_idxs",
+        "pruned_rel_pair_idxs",
+        "ppn_ranked_pair_idxs",
+        "degree_capped_pair_idxs",
+        "box_angle_unit",
+    )
+    target_fields = (
+        "labels",
+        "relation_triplets",
+        "all_relation_triplets",
+        "image_id",
+        "box_angle_unit",
+    )
+    rows = []
+    image_root = Path(cfg["DATASETS"][split.upper()]["IMAGE_ROOT"])
+    class_names = list(cfg["MODEL"]["ROI_BOX_HEAD"].get("CLASS_NAMES", []))
+    predicate_names = list(cfg["MODEL"]["ROI_RELATION_HEAD"].get("RELATION_NAMES", []))
+    for prediction, target, meta in zip(
+        artifacts["predictions"], artifacts["targets"], artifacts["metas"]
+    ):
+        image_id = int(meta.get("source_image_id", meta.get("image_id", -1)))
+        file_name = str(meta.get("file_name", f"{image_id:04d}.png"))
+        output_path = artifact_output_dir / f"{image_id:04d}.pt"
+        torch.save(
+            {
+                "schema_version": 1,
+                "image_id": image_id,
+                "split": split,
+                "filter_method": filter_method,
+                "image_path": str((image_root / file_name).resolve()),
+                "raw_width": int(meta.get("source_width", meta.get("width", target.size[0]))),
+                "raw_height": int(meta.get("source_height", meta.get("height", target.size[1]))),
+                "prediction": _serialize_case_boxlist(prediction, prediction_fields),
+                "target": _serialize_case_boxlist(target, target_fields),
+                "class_names": class_names,
+                "predicate_names": predicate_names,
+            },
+            output_path,
+        )
+        rows.append({"image_id": image_id, "path": str(output_path), "file_name": file_name})
+    (artifact_output_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "split": split,
+                "filter_method": filter_method,
+                "images": rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote {len(rows)} qualitative artifacts to {artifact_output_dir}", flush=True)
 
 
 def _checkpoint_state_dict(ckpt):
@@ -323,6 +469,7 @@ def main():
             rel_cfg["PPN_MODEL_PATH"] = args.pair_filter_checkpoint
         else:
             raise ValueError("--pair-filter-checkpoint requires --filter-method PPN, PPG or RSGP")
+    output_parent = Path(args.output).parent if args.output else Path(cfg["SOLVER"].get("OUTPUT_DIR", "outputs/default"))
     filter_method = str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper()
     if filter_method == "PPN":
         filter_path = rel_cfg.get("PPN_MODEL_PATH", "")
@@ -343,6 +490,8 @@ def main():
 
     split = args.split.lower()
     datasets = build_datasets(cfg, splits=(split,))
+    image_ids = _parse_image_ids(args.image_ids)
+    _restrict_dataset_to_image_ids(datasets[split], image_ids)
     split_meta = datasets[split].metadata
     cfg["MODEL"]["ROI_BOX_HEAD"]["CLASS_NAMES"] = [
         split_meta.categories[i] for i in sorted(split_meta.categories.keys())
@@ -350,6 +499,12 @@ def main():
     cfg["MODEL"]["ROI_RELATION_HEAD"]["RELATION_NAMES"] = [
         split_meta.predicates[i] for i in sorted(split_meta.predicates.keys())
     ]
+    save_run_manifest(
+        cfg,
+        output_parent,
+        config_path=args.config,
+        filename="eval_manifest.json",
+    )
     dataloaders = build_dataloaders(
         cfg,
         splits=(split,),
@@ -368,11 +523,25 @@ def main():
     else:
         raise ValueError(f"Unknown checkpoint load mode: {args.checkpoint_load_mode}")
 
-    metrics, _ = trainer.evaluate_loader(
-        dataloaders[split],
-        return_result=True,
-        max_images=int(args.max_images),
-    )
+    if args.artifact_output_dir:
+        metrics, _, artifacts = trainer.evaluate_loader(
+            dataloaders[split],
+            return_artifacts=True,
+            max_images=int(args.max_images),
+        )
+        _write_case_artifacts(
+            Path(args.artifact_output_dir),
+            artifacts,
+            cfg=cfg,
+            split=split,
+            filter_method=filter_method,
+        )
+    else:
+        metrics, _ = trainer.evaluate_loader(
+            dataloaders[split],
+            return_result=True,
+            max_images=int(args.max_images),
+        )
 
     if args.output:
         output_path = Path(args.output)
@@ -384,6 +553,7 @@ def main():
                     "checkpoint": str(Path(args.checkpoint).resolve()),
                     "split": split,
                     "max_images": int(args.max_images),
+                    "image_ids": image_ids,
                     "metrics": metrics,
                 },
                 ensure_ascii=False,

@@ -2,12 +2,24 @@
 
 ## Dependency boundary
 
-The training and evaluation paths directly require eight external runtime
-packages:
+The public Full training and evaluation paths directly require eight external
+runtime packages:
 
 ```text
 torch, torchvision, numpy, opencv-python, Pillow, h5py, tqdm, mmcv-full
 ```
+
+`mmcv-full==1.7.2` additionally imports four small runtime dependencies, all of
+which are pinned in `requirements.clean.txt`:
+
+```text
+addict, packaging, PyYAML, yapf
+```
+
+The resulting Full-route dependency closure is therefore 12 distributions.
+Conda supplies Python, pip, and Ninja; the installation script pins
+setuptools/wheel for the legacy MMCV build and installs CUDA-matched
+PyTorch/torchvision separately.
 
 These packages are also present in the original RPCM environment, but they are
 normal shared framework dependencies. `mmcv-full` is the only unavoidable
@@ -18,6 +30,29 @@ The project does **not** import `maskrcnn_benchmark`, `mmdet`, `mmrotate`,
 `torch_geometric`, `torch_scatter`, or `torch_sparse`. OBB/polygon conversion is
 implemented locally in `sgg/modeling/core/obb_ops.py`; it is numerically aligned
 with the three conversion helpers previously imported from mmrotate.
+
+The public Full predictor is `RPCM_ORIGINAL_LEGACY`. It does not execute the
+source-audit KMeans branch, so `scikit-learn` and `scipy` are not Full-route
+dependencies. They are needed only by the research-only
+`RPCM_SGG_TOOLKIT_ORIGINAL` audit. Plotting and pytest are likewise optional
+and live in `requirements.analysis.txt`.
+
+## Full-route dependency map
+
+| Function | Package(s) |
+|---|---|
+| tensors, optimization, CUDA, data loading | torch |
+| pretrained model utilities / optional axis-aligned RoIAlign | torchvision |
+| rotated IoU, NMS, and RoIAlign | mmcv-full |
+| STAR arrays and RSGP statistics | numpy |
+| image/OBB geometry helpers | opencv-python |
+| large satellite-image loading | Pillow |
+| STAR annotation storage | h5py |
+| train/test progress | tqdm |
+| MMCV configuration/runtime helpers | addict, packaging, PyYAML, yapf |
+
+Model weights, GloVe vectors, STAR data, the RSGP structural prior, and the
+SGDet detection cache are runtime artifacts rather than Python packages.
 
 The old `pyg` environment is not isolated. Its `easy-install.pth` contains
 absolute paths to:
@@ -72,10 +107,19 @@ Run the strict environment audit after any dependency change:
 python tools/check_environment.py --strict --require-cuda
 ```
 
-It verifies pinned versions, executes rotated MMCV operators on CPU and CUDA,
-checks the local OBB helpers, rejects absolute RPCM/SGG-ToolKit paths, and
-reports any legacy packages still importable. Omit `--require-cuda` only when
+It verifies all 12 pinned distributions, executes rotated IoU/NMS and
+RoIAlignRotated on CPU and CUDA, imports all three public Full configs plus the
+dataset/trainer/evaluator/detector modules, checks the Full predictor and graph
+contract, checks local OBB helpers, rejects absolute RPCM/SGG-ToolKit paths,
+and reports legacy packages still importable. Omit `--require-cuda` only when
 checking a CPU-only development shell.
+
+The audit covers the Python dependency closure. End-to-end artifact and data
+loading is covered separately by the one-image public smoke test:
+
+```bash
+MAX_IMAGES=1 RUN_BACKGROUND=0 bash scripts/test_star_predcls_full.sh
+```
 
 Optional curve plotting and tests use:
 

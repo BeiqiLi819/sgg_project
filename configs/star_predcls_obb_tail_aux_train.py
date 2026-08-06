@@ -102,14 +102,14 @@ cfg["SOLVER"]["LR_SCALE_BY_BATCH"] = False
 cfg["SOLVER"]["WARMUP_ITERS"] = int(os.environ.get("WARMUP_ITERS", "500"))
 cfg["SOLVER"]["STEPS"] = [
     int(step.strip())
-    for step in os.environ.get("STEPS", "10000,14000,16000").split(",")
+    for step in os.environ.get("STEPS", "6000,8500,10000").split(",")
     if step.strip()
 ]
 cfg["SOLVER"]["VAL_START_PERIOD"] = int(os.environ.get("VAL_START_PERIOD", "120"))
 cfg["SOLVER"]["VAL_PERIOD"] = int(os.environ.get("VAL_PERIOD", "2"))
-cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "4"))
+cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "2"))
 cfg["SOLVER"]["MAX_EPOCHS"] = int(os.environ.get("MAX_EPOCHS", "300"))
-cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "test")
+cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "val")
 cfg["SOLVER"]["OUTPUT_DIR"] = os.environ.get(
     "OUTPUT_DIR",
     "outputs/star_predcls_obb_hprc_scratch",

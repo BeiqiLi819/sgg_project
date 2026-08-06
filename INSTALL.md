@@ -21,6 +21,12 @@ The project directly uses these runtime packages:
 torch, torchvision, numpy, opencv-python, Pillow, h5py, tqdm, mmcv-full
 ```
 
+MMCV also requires the pinned pure-Python helpers `addict`, `packaging`,
+`PyYAML`, and `yapf`; `requirements.clean.txt` installs all four. The Full
+train/test route does not require scikit-learn, scipy, PyG, mmdet, mmrotate,
+or maskrcnn_benchmark. Scikit-learn is referenced only by the research-only
+source-original KMeans audit predictor.
+
 `mmcv-full` is required for rotated IoU, rotated NMS, and rotated RoIAlign.
 Install `mmcv-full`, not the lightweight `mmcv` distribution. Never install
 both into the same environment because they provide the same `mmcv` Python
@@ -105,8 +111,10 @@ python tools/check_environment.py --strict --require-cuda
 
 The command verifies:
 
-- exact versions of the eight direct runtime packages;
-- CPU and CUDA execution of MMCV rotated operators;
+- exact versions of the eight direct packages and four MMCV runtime helpers;
+- CPU and CUDA execution of MMCV rotated IoU, NMS, and RoIAlignRotated;
+- imports and predictor/graph contracts for all three public Full configs;
+- dataset, trainer, evaluator, and detector imports used by Full train/test;
 - local OBB geometry helpers;
 - absence of RPCM or SGG-ToolKit paths in `sys.path`;
 - absence of maskrcnn, mmrotate, mmdet, and PyG legacy packages.
@@ -138,10 +146,19 @@ cd /home/ubuntu/research/ssd/sgg_project
 bash scripts/smoke_test_clean_env.sh
 ```
 
-The script first validates CUDA and MMCV, then evaluates the existing PredCls
-checkpoint on two real STAR test images with PPG. It covers dataset loading,
-detector/RPCM checkpoint loading, OBB operators, pair proposal, relation
-inference, and metric output. Successful execution writes:
+After placing the released files described in `pretrained/full/README.md`, a
+one-image end-to-end Full-method check can also be run with:
+
+```bash
+MAX_IMAGES=1 RUN_BACKGROUND=0 bash scripts/test_star_predcls_full.sh
+```
+
+The smoke script first validates CUDA and MMCV, then evaluates the public
+PredCls Full checkpoint on real STAR test images with statistical RSGP (two
+images by default, or one in the command above). It covers
+dataset loading, detector/relation/PPG/PPN checkpoint loading, statistical
+prior loading, OBB operators, pair proposal, relation inference, and metric
+output. Successful execution writes:
 
 ```text
 outputs/environment_smoke_test/test_metrics.json
@@ -151,8 +168,8 @@ The test size and paths can be overridden without editing the script:
 
 ```bash
 MAX_IMAGES=4 \
-CONFIG=configs/star_predcls_obb_tail_aux_train.py \
-CHECKPOINT=outputs/star_predcls_obb_tail_aux/best.pth \
+CONFIG=configs/star_predcls_obb_full.py \
+CHECKPOINT=pretrained/full/STAR_OBB_Full_PredCls.pth \
 OUTPUT_DIR=outputs/environment_smoke_test_4 \
   bash scripts/smoke_test_clean_env.sh
 ```

@@ -5,6 +5,7 @@ from .common import (
     RandomHorizontalFlip,
     RandomOBBRotate,
     ResizeTransform,
+    ShortEdgeResizeTransform,
 )
 from .compose import Compose
 
@@ -13,6 +14,7 @@ __all__ = [
     "IdentityTransform",
     "NormalizeTransform",
     "ResizeTransform",
+    "ShortEdgeResizeTransform",
     "RandomHorizontalFlip",
     "RandomDirectionalFlip",
     "RandomOBBRotate",

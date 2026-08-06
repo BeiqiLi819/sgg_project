@@ -20,8 +20,7 @@ class ResizeTransform:
         self.size = size
         self.keep_ratio = bool(keep_ratio)
 
-    def __call__(self, image: torch.Tensor, target: BoxList):
-        _, in_h, in_w = image.shape
+    def _output_size(self, in_h: int, in_w: int) -> Tuple[int, int]:
         target_h, target_w = self.size
         if self.keep_ratio:
             scale = min(target_w / max(in_w, 1), target_h / max(in_h, 1))
@@ -29,6 +28,11 @@ class ResizeTransform:
             out_h = max(int(round(in_h * scale)), 1)
         else:
             out_h, out_w = target_h, target_w
+        return out_h, out_w
+
+    def __call__(self, image: torch.Tensor, target: BoxList):
+        _, in_h, in_w = image.shape
+        out_h, out_w = self._output_size(in_h, in_w)
         image = torch.nn.functional.interpolate(
             image.unsqueeze(0),
             size=(out_h, out_w),
@@ -59,6 +63,37 @@ class ResizeTransform:
                 value[:, [1, 3]] *= scale_y
             resized.add_field(field, value)
         return image, resized
+
+
+class ShortEdgeResizeTransform(ResizeTransform):
+    """Resize the short edge while capping the long edge.
+
+    This is the resize convention used by the original SGG-Toolkit/RPCM
+    configs (``MIN_SIZE_*`` plus ``MAX_SIZE_*``).  It is intentionally
+    separate from the project's default fit-inside-``IMAGE_SIZE`` behavior so
+    existing experiments and checkpoints keep their established protocol.
+    """
+
+    def __init__(self, min_size: int, max_size: int):
+        min_size = int(min_size)
+        max_size = int(max_size)
+        if min_size <= 0 or max_size <= 0:
+            raise ValueError("min_size and max_size must be positive")
+        if max_size < min_size:
+            raise ValueError("max_size must be greater than or equal to min_size")
+        super().__init__((min_size, max_size), keep_ratio=True)
+        self.min_size = min_size
+        self.max_size = max_size
+
+    def _output_size(self, in_h: int, in_w: int) -> Tuple[int, int]:
+        short_edge = min(in_h, in_w)
+        long_edge = max(in_h, in_w)
+        scale = self.min_size / max(short_edge, 1)
+        if long_edge * scale > self.max_size:
+            scale = self.max_size / max(long_edge, 1)
+        out_h = max(int(round(in_h * scale)), 1)
+        out_w = max(int(round(in_w * scale)), 1)
+        return out_h, out_w
 
 
 class NormalizeTransform:

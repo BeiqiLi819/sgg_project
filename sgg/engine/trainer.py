@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from bisect import bisect_right
+import json
 import math
+import resource
 import sys
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -37,6 +39,104 @@ def _format_duration(seconds: float) -> str:
     if hours > 0:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+class _ValidationEarlyStopper:
+    """Track validation-level early stopping independently of LR scheduling."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        metric: str = "HR",
+        patience: int = 10,
+        min_delta: float = 0.0,
+        start_period: int = 0,
+    ):
+        self.enabled = bool(enabled)
+        metric_aliases = {
+            "r": "R",
+            "mr": "mR",
+            "hr": "HR",
+            "hmr": "HR",
+        }
+        metric_text = str(metric).strip()
+        self.metric = metric_aliases.get(metric_text.lower(), metric_text)
+        if self.metric not in {"R", "mR", "HR"}:
+            raise ValueError(
+                "SOLVER.EARLY_STOP_METRIC must be R, mR, or HR, "
+                f"got {self.metric!r}"
+            )
+        self.patience = int(patience)
+        if self.enabled and self.patience <= 0:
+            raise ValueError(
+                "SOLVER.EARLY_STOP_PATIENCE must be positive when early "
+                f"stopping is enabled, got {self.patience}"
+            )
+        self.min_delta = max(float(min_delta), 0.0)
+        self.start_period = max(int(start_period), 0)
+        self.reset_progress()
+
+    def reset_progress(self) -> None:
+        self.best = float("-inf")
+        self.best_epoch = 0
+        self.bad_validations = 0
+        self.last_epoch = 0
+        self.last_value = float("-inf")
+
+    def update(self, epoch: int, value: float) -> Tuple[bool, bool]:
+        """Return ``(should_stop, improved)`` for one validation event."""
+
+        epoch = int(epoch)
+        value = float(value)
+        self.last_epoch = epoch
+        self.last_value = value
+        if not self.enabled or epoch < self.start_period:
+            return False, False
+
+        improved = math.isfinite(value) and (
+            not math.isfinite(self.best) or value > self.best + self.min_delta
+        )
+        if improved:
+            self.best = value
+            self.best_epoch = epoch
+            self.bad_validations = 0
+        else:
+            self.bad_validations += 1
+        return self.should_stop, improved
+
+    @property
+    def should_stop(self) -> bool:
+        return bool(
+            self.enabled
+            and self.bad_validations >= self.patience
+            and self.last_epoch >= self.start_period
+        )
+
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "metric": self.metric,
+            "best": float(self.best),
+            "best_epoch": int(self.best_epoch),
+            "bad_validations": int(self.bad_validations),
+            "last_epoch": int(self.last_epoch),
+            "last_value": float(self.last_value),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if not isinstance(state, dict):
+            return
+        state_metric = str(state.get("metric", self.metric))
+        if state_metric != self.metric:
+            return
+        self.best = float(state.get("best", self.best))
+        self.best_epoch = int(state.get("best_epoch", self.best_epoch))
+        self.bad_validations = max(
+            int(state.get("bad_validations", self.bad_validations)),
+            0,
+        )
+        self.last_epoch = max(int(state.get("last_epoch", self.last_epoch)), 0)
+        self.last_value = float(state.get("last_value", self.last_value))
 
 
 def _predicate_name(predicate_names, idx: int) -> str:
@@ -86,6 +186,41 @@ def _build_eval_report_lines(
     lines.append(_format_metric_dict_row("R", metrics.get("R", {}), topk))
     lines.append(_format_metric_dict_row("mR", metrics.get("mR", {}), topk))
     lines.append(_format_metric_dict_row("HMR", metrics.get("HR", {}), topk))
+    graph = metrics.get("candidate-graph", {})
+    if graph:
+        lines.append(
+            "Candidate Graph: "
+            f"GT-pair={float(metrics.get('candidate-stage-coverage', {}).get('final', 0.0)):.4f}, "
+            f"node={float(graph.get('avg_candidate_node_coverage', 0.0)):.4f}, "
+            f"degree-gini={float(graph.get('avg_degree_gini', 0.0)):.4f}, "
+            f"max-degree={float(graph.get('max_degree', 0.0)):.0f}, "
+            f"label-pair-entropy={float(graph.get('avg_label_pair_entropy', 0.0)):.4f}"
+        )
+    for bucket, bucket_metrics in metrics.get("candidate-pressure", {}).items():
+        lines.append(
+            f"Candidate Pressure [{bucket}] images={int(bucket_metrics.get('images', 0))}: "
+            + _format_metric_dict_row(
+                "R", bucket_metrics.get("R", {}), topk
+            ).strip()
+            + " ; "
+            + _format_metric_dict_row(
+                "mR", bucket_metrics.get("mR", {}), topk
+            ).strip()
+            + " ; "
+            + _format_metric_dict_row(
+                "HMR", bucket_metrics.get("HMR", {}), topk
+            ).strip()
+        )
+    resources = metrics.get("resources", {})
+    if resources:
+        lines.append(
+            "Inference Resources: "
+            f"proposal={float(resources.get('pair_proposal_seconds', 0.0)):.3f}s, "
+            f"model={float(resources.get('model_forward_seconds', 0.0)):.3f}s, "
+            f"wall={float(resources.get('inference_wall_seconds', 0.0)):.3f}s, "
+            f"cuda_peak={int(resources.get('peak_cuda_memory_bytes', 0))}B, "
+            f"rss_peak={int(resources.get('process_peak_rss_bytes', 0))}B"
+        )
 
     predicate_ids = sorted(
         {
@@ -734,8 +869,13 @@ class Trainer:
         dataloaders: Optional[Dict[str, object]] = None,
     ):
         self.cfg = cfg
-        self.model = model.to(device)
-        self.device = device
+        # Keep a canonical torch.device internally.  Training historically
+        # accepted a CLI string (for example ``"cuda"``), which is valid for
+        # Module.to(), but inference profiling also queries ``device.type``.
+        # Normalizing here keeps both ordinary and profiled evaluation paths
+        # consistent regardless of how the Trainer was constructed.
+        self.device = torch.device(device)
+        self.model = model.to(self.device)
         self.dataloaders = dataloaders or {}
         self._apply_freeze_config()
         self.optimizer = self._build_optimizer(model)
@@ -760,6 +900,15 @@ class Trainer:
             "mR": float("-inf"),
             "HR": float("-inf"),
         }
+        solver_cfg = cfg.get("SOLVER", {})
+        self.early_stopper = _ValidationEarlyStopper(
+            enabled=bool(solver_cfg.get("EARLY_STOP_ENABLED", False)),
+            metric=str(solver_cfg.get("EARLY_STOP_METRIC", "HR")),
+            patience=int(solver_cfg.get("EARLY_STOP_PATIENCE", 10)),
+            min_delta=float(solver_cfg.get("EARLY_STOP_MIN_DELTA", 0.0)),
+            start_period=int(solver_cfg.get("EARLY_STOP_START_PERIOD", 0)),
+        )
+        self._validation_tracking_loaded = False
 
     def reset_solver_state(self, global_step: int = 0):
         """Rebuild optimizer/scheduler from the current config after model load.
@@ -782,6 +931,124 @@ class Trainer:
             {"global_step": self.global_step, "lr": max(float(group["lr"]) for group in self.optimizer.param_groups)},
             flush=True,
         )
+
+    def reset_scheduler_state(self, global_step: int = 0):
+        """Rebuild only the LR scheduler while preserving optimizer state.
+
+        A normal resume restores the serialized scheduler and its old
+        milestones. This path keeps momentum and all other optimizer buffers,
+        but recomputes the current LR from the new config and global step.
+        """
+
+        self.scheduler = self._build_scheduler()
+        self.global_step = int(global_step)
+        if hasattr(self.scheduler, "last_epoch"):
+            self.scheduler.last_epoch = self.global_step
+        if hasattr(self.scheduler, "get_lr"):
+            lrs = list(self.scheduler.get_lr())
+            for param_group, lr in zip(self.optimizer.param_groups, lrs):
+                param_group["lr"] = lr
+            if hasattr(self.scheduler, "_last_lr"):
+                self.scheduler._last_lr = lrs
+        print(
+            "Reset scheduler from current config; optimizer state preserved:",
+            {
+                "global_step": self.global_step,
+                "lr": max(
+                    float(group["lr"])
+                    for group in self.optimizer.param_groups
+                ),
+            },
+            flush=True,
+        )
+
+    def _restore_validation_tracking_from_history(
+        self,
+        *,
+        max_epoch: int,
+        recall_k: int,
+    ) -> bool:
+        """Reconstruct best metrics and early-stop patience for old checkpoints."""
+
+        history_path = self.output_dir / "validation_history.jsonl"
+        if not history_path.is_file() or int(max_epoch) <= 0:
+            return False
+
+        expected_split = str(self.cfg["SOLVER"].get("VAL_SPLIT", "val"))
+        expected_filter = str(
+            self.cfg["MODEL"]["ROI_RELATION_HEAD"].get(
+                "TEST_FILTER_METHOD",
+                "",
+            )
+        )
+        records = []
+        with history_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Invalid validation history at {history_path}:{line_number}"
+                    ) from exc
+                epoch = int(record.get("epoch", 0))
+                if epoch <= 0 or epoch > int(max_epoch):
+                    continue
+                if str(record.get("split", expected_split)) != expected_split:
+                    continue
+                if str(record.get("filter_method", expected_filter)) != expected_filter:
+                    continue
+                records.append(record)
+        if not records:
+            return False
+
+        records.sort(key=lambda row: int(row["epoch"]))
+        self.best_metrics = {
+            "R": float("-inf"),
+            "mR": float("-inf"),
+            "HR": float("-inf"),
+        }
+        self.early_stopper.reset_progress()
+        for record in records:
+            epoch = int(record["epoch"])
+            metrics = record.get("metrics", {})
+            for metric_name in self.best_metrics:
+                value = float(
+                    metrics.get(metric_name, {}).get(
+                        str(recall_k),
+                        metrics.get(metric_name, {}).get(
+                            int(recall_k),
+                            float("-inf"),
+                        ),
+                    )
+                )
+                if value > self.best_metrics[metric_name]:
+                    self.best_metrics[metric_name] = value
+            early_value = float(
+                metrics.get(self.early_stopper.metric, {}).get(
+                    str(recall_k),
+                    metrics.get(self.early_stopper.metric, {}).get(
+                        int(recall_k),
+                        float("-inf"),
+                    ),
+                )
+            )
+            self.early_stopper.update(epoch, early_value)
+
+        print(
+            "Restored validation tracking from history:",
+            {
+                "path": str(history_path),
+                "records": len(records),
+                "through_epoch": int(records[-1]["epoch"]),
+                "best_metrics": self.best_metrics,
+                "early_stopping": self.early_stopper.state_dict(),
+            },
+            flush=True,
+        )
+        return True
 
     def _apply_freeze_config(self):
         model_cfg = self.cfg.get("MODEL", {})
@@ -973,6 +1240,8 @@ class Trainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if hasattr(self.scheduler, "state_dict") else None,
             "global_step": self.global_step,
+            "best_metrics": dict(self.best_metrics),
+            "early_stopping": self.early_stopper.state_dict(),
             "cfg": self.cfg,
             "detector_class_channel_order": INTERNAL_DETECTOR_CLASS_ORDER,
         }
@@ -1078,6 +1347,25 @@ class Trainer:
             self.scheduler.load_state_dict(ckpt["scheduler"])
         if resume_state_loaded and isinstance(ckpt, dict) and "global_step" in ckpt:
             self.global_step = int(ckpt["global_step"])
+        loaded_best_metrics = bool(
+            isinstance(ckpt, dict)
+            and isinstance(ckpt.get("best_metrics"), dict)
+        )
+        if loaded_best_metrics:
+            for metric_name in self.best_metrics:
+                if metric_name in ckpt["best_metrics"]:
+                    self.best_metrics[metric_name] = float(
+                        ckpt["best_metrics"][metric_name]
+                    )
+        loaded_early_stopping = bool(
+            isinstance(ckpt, dict)
+            and isinstance(ckpt.get("early_stopping"), dict)
+        )
+        if loaded_early_stopping:
+            self.early_stopper.load_state_dict(ckpt["early_stopping"])
+        self._validation_tracking_loaded = bool(
+            loaded_best_metrics and loaded_early_stopping
+        )
         return ckpt
 
     @staticmethod
@@ -1314,6 +1602,86 @@ class Trainer:
         # detector and avoiding a giant padded (B,C,H,W) GPU allocation.
         return list(raw_images), list(raw_targets)
 
+    def _validate_and_track(
+        self,
+        val_loader,
+        *,
+        epoch: int,
+        best_recall_k: int,
+    ):
+        """Evaluate once and update the shared best/early-stop state.
+
+        Keeping this operation independent from epoch boundaries lets the
+        6850 reproduction use the source RPCM protocol (validation every 200
+        optimizer steps) without changing the behavior of existing configs.
+        """
+
+        eval_start = time.perf_counter()
+        metrics = self.evaluate_loader(val_loader)
+        eval_elapsed = time.perf_counter() - eval_start
+        validation_record = {
+            "epoch": int(epoch),
+            "global_step": int(self.global_step),
+            "split": str(self.cfg["SOLVER"].get("VAL_SPLIT", "val")),
+            "filter_method": str(
+                self.cfg["MODEL"]["ROI_RELATION_HEAD"].get(
+                    "TEST_FILTER_METHOD", ""
+                )
+            ),
+            "metrics": metrics,
+        }
+        with (self.output_dir / "validation_history.jsonl").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(json.dumps(validation_record, ensure_ascii=False) + "\n")
+
+        early_stop_metric = float(
+            metrics.get(self.early_stopper.metric, {}).get(
+                best_recall_k,
+                float("-inf"),
+            )
+        )
+        early_stop_requested, early_stop_improved = self.early_stopper.update(
+            epoch,
+            early_stop_metric,
+        )
+        for metric_name in ("R", "mR", "HR"):
+            current_metric = float(
+                metrics.get(metric_name, {}).get(best_recall_k, float("-inf"))
+            )
+            if current_metric > self.best_metrics[metric_name]:
+                self.best_metrics[metric_name] = current_metric
+                self.save_checkpoint(
+                    epoch,
+                    f"model_best_{metric_name}.pth",
+                    metrics=metrics,
+                )
+                print(
+                    f"Saved best {metric_name} checkpoint: "
+                    f"{metric_name}@{best_recall_k}={current_metric:.6f} "
+                    f"at global_step={self.global_step}",
+                    flush=True,
+                )
+        if self.early_stopper.enabled:
+            print(
+                "Early-stopping status:",
+                {
+                    "metric": f"{self.early_stopper.metric}@{best_recall_k}",
+                    "current": early_stop_metric,
+                    "improved": bool(early_stop_improved),
+                    "window_best": self.early_stopper.best,
+                    "window_best_epoch": self.early_stopper.best_epoch,
+                    "checkpoint_best": self.best_metrics.get(
+                        self.early_stopper.metric,
+                        float("-inf"),
+                    ),
+                    "bad_validations": self.early_stopper.bad_validations,
+                    "patience_validations": self.early_stopper.patience,
+                },
+                flush=True,
+            )
+        return metrics, eval_elapsed, early_stop_requested
+
     def train(self, start_epoch: int = 0):
         val_split = str(self.cfg.get("SOLVER", {}).get("VAL_SPLIT", "val")).lower()
         loaders = self.dataloaders or build_dataloaders(
@@ -1339,6 +1707,10 @@ class Trainer:
         # configs while retaining epoch-based behavior for existing runs.
         max_iterations = max(0, int(self.cfg.get("SOLVER", {}).get("MAX_ITER", 0)))
         iteration_compat = bool(self.cfg.get("SOLVER", {}).get("ITERATION_COMPAT", False))
+        validate_on_iter = bool(
+            iteration_compat
+            and self.cfg.get("SOLVER", {}).get("VALIDATE_ON_ITER", False)
+        )
         val_period_iter = max(
             0,
             int(
@@ -1355,9 +1727,9 @@ class Trainer:
                 )
             ),
         )
-        if val_period_iter > 0:
+        if val_period_iter > 0 and not validate_on_iter:
             self.val_period = max(1, math.ceil(val_period_iter / optimizer_steps_per_epoch))
-        if val_start_iter > 0:
+        if val_start_iter > 0 and not validate_on_iter:
             self.val_start_period = max(1, math.ceil(val_start_iter / optimizer_steps_per_epoch))
         if max_iterations > 0:
             required_epochs = math.ceil(max(max_iterations - self.global_step, 0) / optimizer_steps_per_epoch)
@@ -1371,6 +1743,41 @@ class Trainer:
         if not self._scheduler_resolved and self.global_step == 0:
             self.scheduler = self._build_scheduler(num_iters_per_epoch=optimizer_steps_per_epoch)
         start_epoch = max(0, min(int(start_epoch), int(epochs)))
+        if not self._validation_tracking_loaded:
+            self._restore_validation_tracking_from_history(
+                max_epoch=start_epoch,
+                recall_k=best_recall_k,
+            )
+        if self.early_stopper.enabled:
+            print(
+                "Validation early stopping enabled:",
+                {
+                    "metric": f"{self.early_stopper.metric}@{best_recall_k}",
+                    "patience_validations": self.early_stopper.patience,
+                    "min_delta": self.early_stopper.min_delta,
+                    "start_epoch": self.early_stopper.start_period,
+                    "restored_bad_validations": self.early_stopper.bad_validations,
+                },
+                flush=True,
+            )
+            if self.early_stopper.should_stop:
+                print(
+                    "Early-stopping condition was already reached before resume; "
+                    "no additional training epoch is required:",
+                    self.early_stopper.state_dict(),
+                    flush=True,
+                )
+                return
+        if validate_on_iter:
+            print(
+                "Iteration-boundary validation enabled:",
+                {
+                    "start_step": val_start_iter,
+                    "period_steps": val_period_iter,
+                    "max_iter": max_iterations,
+                },
+                flush=True,
+            )
         epoch_durations: List[float] = []
         for epoch in range(start_epoch, epochs):
             if max_iterations > 0 and self.global_step >= max_iterations:
@@ -1380,6 +1787,8 @@ class Trainer:
             self._set_frozen_modules_eval()
             epoch_loss_sums: Dict[str, float] = {}
             epoch_loss_count = 0
+            iteration_eval_elapsed = 0.0
+            early_stop_requested = False
             pbar = tqdm(train_loader, desc=f"epoch {epoch+1}/{epochs}", disable=_disable_tqdm_for_non_tty())
             self.optimizer.zero_grad(set_to_none=True)
             reached_max_iterations = False
@@ -1485,6 +1894,33 @@ class Trainer:
                         flush=True,
                     )
 
+                if (
+                    should_step
+                    and validate_on_iter
+                    and val_loader is not None
+                    and val_period_iter > 0
+                    and self.global_step >= val_start_iter
+                    and self.global_step % val_period_iter == 0
+                ):
+                    print(
+                        f"Validation at optimizer step {self.global_step} "
+                        f"(epoch {epoch + 1}/{epochs})",
+                        flush=True,
+                    )
+                    _, elapsed, early_stop_requested = self._validate_and_track(
+                        val_loader,
+                        epoch=epoch + 1,
+                        best_recall_k=best_recall_k,
+                    )
+                    iteration_eval_elapsed += elapsed
+                    # evaluate_loader leaves the model in eval mode. Resume
+                    # the interrupted training epoch under the same freezing
+                    # contract as its beginning.
+                    self.model.train()
+                    self._set_frozen_modules_eval()
+                    if early_stop_requested:
+                        break
+
             if epoch_loss_count > 0:
                 avg_losses = {
                     key: value / epoch_loss_count
@@ -1494,23 +1930,22 @@ class Trainer:
                 current_lr = max(float(group["lr"]) for group in self.optimizer.param_groups)
                 print(f"epoch {epoch + 1}/{epochs} lr: {current_lr:.8g}", flush=True)
 
-            train_elapsed = time.perf_counter() - epoch_start
-            eval_elapsed = 0.0
+            train_elapsed = time.perf_counter() - epoch_start - iteration_eval_elapsed
+            eval_elapsed = iteration_eval_elapsed
             metrics = None
-            if val_loader is not None and (epoch + 1) >= self.val_start_period and ((epoch + 1) % self.val_period == 0):
-                eval_start = time.perf_counter()
-                metrics = self.evaluate_loader(val_loader)
-                eval_elapsed = time.perf_counter() - eval_start
-                for metric_name in ("R", "mR", "HR"):
-                    current_metric = float(metrics.get(metric_name, {}).get(best_recall_k, float("-inf")))
-                    if current_metric > self.best_metrics[metric_name]:
-                        self.best_metrics[metric_name] = current_metric
-                        self.save_checkpoint(epoch + 1, f"model_best_{metric_name}.pth", metrics=metrics)
-                        print(
-                            f"Saved best {metric_name} checkpoint: {metric_name}@{best_recall_k}={current_metric:.6f}",
-                            flush=True,
-                        )
-            elif val_loader is not None:
+            if (
+                not validate_on_iter
+                and val_loader is not None
+                and (epoch + 1) >= self.val_start_period
+                and ((epoch + 1) % self.val_period == 0)
+            ):
+                metrics, elapsed, early_stop_requested = self._validate_and_track(
+                    val_loader,
+                    epoch=epoch + 1,
+                    best_recall_k=best_recall_k,
+                )
+                eval_elapsed += elapsed
+            elif val_loader is not None and not validate_on_iter:
                 skip_reasons = []
                 if (epoch + 1) < self.val_start_period:
                     skip_reasons.append(f"epoch {epoch + 1}/{epochs} < VAL_START_PERIOD={self.val_start_period}")
@@ -1540,6 +1975,24 @@ class Trainer:
             if reached_max_iterations:
                 print(f"Reached SOLVER.MAX_ITER={max_iterations}; stopping training.", flush=True)
                 break
+            if early_stop_requested:
+                print(
+                    "Early stopping triggered after validation:",
+                    {
+                        "epoch": epoch + 1,
+                        "metric": f"{self.early_stopper.metric}@{best_recall_k}",
+                        "window_best": self.early_stopper.best,
+                        "window_best_epoch": self.early_stopper.best_epoch,
+                        "checkpoint_best": self.best_metrics.get(
+                            self.early_stopper.metric,
+                            float("-inf"),
+                        ),
+                        "bad_validations": self.early_stopper.bad_validations,
+                        "patience_validations": self.early_stopper.patience,
+                    },
+                    flush=True,
+                )
+                break
 
     @torch.no_grad()
     def evaluate_loader(
@@ -1547,8 +2000,15 @@ class Trainer:
         loader,
         return_result: bool = False,
         max_images: int = -1,
+        return_artifacts: bool = False,
     ):
         self.model.eval()
+        profile_inference = bool(self.cfg.get("TEST", {}).get("PROFILE_INFERENCE", False))
+        if profile_inference and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+        eval_wall_start = time.perf_counter()
+        model_forward_seconds = 0.0
         preds_all = []
         gts_all = []
         metas_all = []
@@ -1586,6 +2046,9 @@ class Trainer:
                     flush=True,
                 )
             try:
+                if profile_inference and self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                forward_start = time.perf_counter()
                 preds = self.model(
                     images,
                     # Sgdet relation evaluation itself stays target-free, but
@@ -1595,6 +2058,10 @@ class Trainer:
                     detector_images=detector_images,
                     detector_targets=detector_targets,
                 )
+                if profile_inference and self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                if profile_inference:
+                    model_forward_seconds += time.perf_counter() - forward_start
             except torch.cuda.OutOfMemoryError:
                 if graph_debug_enabled:
                     print(
@@ -1610,6 +2077,7 @@ class Trainer:
             preds_all.extend([p.to("cpu") for p in preds])
             gts_all.extend([t.to("cpu") for t in targets])
             metas_all.extend(metas)
+        inference_wall_seconds = time.perf_counter() - eval_wall_start
         if any("tile_origin" in meta for meta in metas_all):
             preds_all, gts_all = _merge_tile_batches(
                 preds_all,
@@ -1636,13 +2104,59 @@ class Trainer:
             "R": res.recall,
             "mR": res.mean_recall,
             "HR": harmonic_recall,
+            # Keep the complete class-wise and image-wise records in the JSON.
+            # The console table is convenient for inspection, but a structured
+            # representation is required for paper tables and paired qualitative
+            # case selection without re-running inference.
+            "per-predicate-recall": res.per_predicate_recall,
+            "predicate-counts": res.predicate_counts,
+            "per-image": res.debug_rows,
             "candidate-stage-coverage": res.candidate_stage_coverage,
             "predicate-candidate-stage-coverage": res.predicate_candidate_stage_coverage,
+            "candidate-graph": res.graph_statistics,
+            "candidate-pressure": res.pressure_stratified_metrics,
             "vehicle-aux": res.vehicle_aux_stats,
             "A": res.pair_accuracy if self.cfg["MODEL"]["TASK"] != "sgdet" else {},
             "images": res.num_images,
             "valid_images": res.valid_images,
         }
+        failure_cases = sorted(
+            res.debug_rows,
+            key=lambda item: (
+                float(item.get("triplet_recall", 0.0)),
+                -int(item.get("gt_rel_count", 0)),
+                int(item.get("image_id", -1)),
+            ),
+        )
+        metrics["failure-cases"] = failure_cases[:10]
+        if profile_inference:
+            proposal_seconds = 0.0
+            for prediction in preds_all:
+                if prediction.has_field("pair_proposal_time_seconds"):
+                    proposal_seconds += float(
+                        prediction.get_field("pair_proposal_time_seconds").double().sum().item()
+                    )
+            peak_cuda_bytes = (
+                int(torch.cuda.max_memory_allocated(self.device))
+                if self.device.type == "cuda"
+                else 0
+            )
+            max_rss_kb = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            metrics["resources"] = {
+                "profiled": True,
+                "images": int(res.num_images),
+                "pair_proposal_seconds": float(proposal_seconds),
+                "model_forward_seconds": float(model_forward_seconds),
+                "inference_wall_seconds": float(inference_wall_seconds),
+                "pair_proposal_seconds_per_image": float(
+                    proposal_seconds / max(res.num_images, 1)
+                ),
+                "model_forward_seconds_per_image": float(
+                    model_forward_seconds / max(res.num_images, 1)
+                ),
+                "peak_cuda_memory_bytes": peak_cuda_bytes,
+                "process_peak_rss_bytes": int(max_rss_kb * 1024),
+            }
         predicate_names = getattr(getattr(loader, "dataset", None), "ind_to_predicates", None)
         for line in _build_eval_report_lines(
             metrics,
@@ -1761,6 +2275,12 @@ class Trainer:
                 print_vehicle_aux=bool(debug_cfg.get("PRINT_VEHICLE_AUX", False)),
             ):
                 print(line, flush=True)
+        if return_artifacts:
+            return metrics, res, {
+                "predictions": preds_all,
+                "targets": gts_all,
+                "metas": metas_all,
+            }
         if return_result:
             return metrics, res
         return metrics

@@ -18,7 +18,7 @@ class SGGResult:
     valid_images: int
     per_predicate_recall: Dict[int, Dict[int, float]]
     predicate_counts: Dict[int, int]
-    debug_rows: List[Dict[str, float | int]]
+    debug_rows: List[Dict[str, object]]
     no_graph_constraint_recall: Dict[int, float] = field(default_factory=dict)
     zero_shot_recall: Dict[int, float] = field(default_factory=dict)
     ng_zero_shot_recall: Dict[int, float] = field(default_factory=dict)
@@ -42,6 +42,8 @@ class SGGResult:
     candidate_stage_coverage: Dict[str, float] = field(default_factory=dict)
     predicate_candidate_stage_coverage: Dict[str, Dict[int, float]] = field(default_factory=dict)
     vehicle_aux_stats: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    graph_statistics: Dict[str, float] = field(default_factory=dict)
+    pressure_stratified_metrics: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass
@@ -72,6 +74,52 @@ def _safe_mean(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     return float(sum(values) / len(values))
+
+
+def _degree_gini(degrees: torch.Tensor) -> float:
+    """Return the Gini coefficient of a non-negative node-degree vector."""
+    values = degrees.detach().float().reshape(-1).cpu()
+    if values.numel() == 0 or float(values.sum().item()) <= 0.0:
+        return 0.0
+    values, _ = torch.sort(values)
+    n = int(values.numel())
+    ranks = torch.arange(1, n + 1, dtype=values.dtype)
+    numerator = torch.sum((2.0 * ranks - n - 1.0) * values)
+    return float((numerator / (n * values.sum())).item())
+
+
+def _label_pair_entropy(labels: torch.Tensor, pairs: torch.Tensor) -> float:
+    """Shannon entropy (nats) of directed object-label pairs in a graph."""
+    if labels.numel() == 0 or pairs.numel() == 0:
+        return 0.0
+    pairs = pairs.long().reshape(-1, 2)
+    valid = (
+        (pairs[:, 0] >= 0)
+        & (pairs[:, 0] < labels.numel())
+        & (pairs[:, 1] >= 0)
+        & (pairs[:, 1] < labels.numel())
+    )
+    pairs = pairs[valid]
+    if pairs.numel() == 0:
+        return 0.0
+    label_count = max(int(labels.max().item()) + 1, 1)
+    codes = labels[pairs[:, 0]].long() * label_count + labels[pairs[:, 1]].long()
+    counts = torch.unique(codes, return_counts=True)[1].float()
+    probabilities = counts / counts.sum().clamp_min(1.0)
+    return float((-(probabilities * probabilities.clamp_min(1e-12).log()).sum()).item())
+
+
+def _pressure_bucket(candidate_count: int, topk_budget: int = 10000) -> str:
+    """Bucket an image by its semantic-filter candidate load before top-k."""
+    candidate_count = max(int(candidate_count), 0)
+    topk_budget = max(int(topk_budget), 1)
+    if candidate_count <= topk_budget:
+        return "no_truncation"
+    if candidate_count <= 2 * topk_budget:
+        return "overload_low"
+    if candidate_count <= 5 * topk_budget:
+        return "overload_medium"
+    return "overload_high"
 
 
 def _get_gt_relations(target: BoxList) -> torch.Tensor:
@@ -529,7 +577,7 @@ def evaluate_sgg(
         zeroshot_triplets = zeroshot_triplets.long().cpu()
 
     predicate_counts: Dict[int, int] = {}
-    debug_rows: List[Dict[str, float | int]] = []
+    debug_rows: List[Dict[str, object]] = []
     valid_images = 0
     num_predicates = 0
 
@@ -552,6 +600,25 @@ def evaluate_sgg(
     vehicle_aux_hits: Dict[int, int] = {}
     vehicle_aux_logit_sum: Dict[int, float] = {}
     candidate_stage_total = 0
+    graph_image_stats: List[Dict[str, float]] = []
+    pressure_bucket_names = (
+        "no_truncation",
+        "overload_low",
+        "overload_medium",
+        "overload_high",
+    )
+    pressure_recall = {
+        name: _GraphRecallMetric(topk)
+        for name in pressure_bucket_names
+    }
+    pressure_mean_recall = {
+        name: _MeanRecallMetric(topk, num_predicates)
+        for name in pressure_bucket_names
+    }
+    pressure_counts = {
+        name: {"images": 0, "semantic_candidates": 0, "final_candidates": 0}
+        for name in pressure_bucket_names
+    }
 
     for pred, target in zip(predictions, targets):
         ctx = _build_image_context(pred, target, mode)
@@ -597,6 +664,62 @@ def evaluate_sgg(
         for _, _, predicate in ctx.gt_rels.tolist():
             predicate = int(predicate)
             predicate_counts[predicate] = predicate_counts.get(predicate, 0) + 1
+
+        semantic_pairs = (
+            pred.get_field("sema_rel_pair_idxs").long().reshape(-1, 2)
+            if pred.has_field("sema_rel_pair_idxs")
+            else ctx.pred_pair_idx
+        )
+        raw_pairs = (
+            pred.get_field("base_rel_pair_idxs").long().reshape(-1, 2)
+            if pred.has_field("base_rel_pair_idxs")
+            else semantic_pairs
+        )
+        num_nodes = int(ctx.pred_obj_labels.numel())
+        degrees = torch.zeros((num_nodes,), dtype=torch.float32)
+        valid_final_pairs = ctx.pred_pair_idx.long().reshape(-1, 2)
+        if valid_final_pairs.numel() > 0 and num_nodes > 0:
+            valid_mask = (
+                (valid_final_pairs[:, 0] >= 0)
+                & (valid_final_pairs[:, 0] < num_nodes)
+                & (valid_final_pairs[:, 1] >= 0)
+                & (valid_final_pairs[:, 1] < num_nodes)
+            )
+            valid_final_pairs = valid_final_pairs[valid_mask]
+            if valid_final_pairs.numel() > 0:
+                ones = torch.ones(valid_final_pairs.size(0), dtype=degrees.dtype)
+                degrees.index_add_(0, valid_final_pairs[:, 0], ones)
+                degrees.index_add_(0, valid_final_pairs[:, 1], ones)
+        active_nodes = int((degrees > 0).sum().item())
+        gt_relation_node_coverage = 0.0
+        if mode in {"predcls", "sgcls"} and ctx.gt_rels.numel() > 0:
+            gt_relation_nodes = torch.unique(ctx.gt_rels[:, :2].long())
+            if gt_relation_nodes.numel() > 0:
+                valid_gt_nodes = gt_relation_nodes[
+                    (gt_relation_nodes >= 0) & (gt_relation_nodes < num_nodes)
+                ]
+                gt_relation_node_coverage = float(
+                    (degrees[valid_gt_nodes] > 0).sum().item()
+                    / max(int(gt_relation_nodes.numel()), 1)
+                )
+        graph_row = {
+            "raw_candidates": float(raw_pairs.size(0)),
+            "semantic_candidates": float(semantic_pairs.size(0)),
+            "final_candidates": float(ctx.pred_pair_idx.size(0)),
+            "candidate_node_coverage": float(active_nodes / max(num_nodes, 1)),
+            "gt_relation_node_coverage": gt_relation_node_coverage,
+            "degree_gini": _degree_gini(degrees),
+            "max_degree": float(degrees.max().item()) if degrees.numel() > 0 else 0.0,
+            "label_pair_entropy": _label_pair_entropy(
+                ctx.pred_obj_labels,
+                valid_final_pairs,
+            ),
+        }
+        graph_image_stats.append(graph_row)
+        pressure_name = _pressure_bucket(int(semantic_pairs.size(0)))
+        pressure_counts[pressure_name]["images"] += 1
+        pressure_counts[pressure_name]["semantic_candidates"] += int(semantic_pairs.size(0))
+        pressure_counts[pressure_name]["final_candidates"] += int(ctx.pred_pair_idx.size(0))
 
         sorted_pairs, sorted_rels, sorted_rel_scores, _ = _graph_constrained_predictions(ctx)
         if pred.has_field("vehicle_aux_logits") and pred.has_field("vehicle_aux_predicates"):
@@ -650,6 +773,8 @@ def evaluate_sgg(
             use_gt_boxes=use_gt_boxes,
         )
         matched_by_k, matched_sets_by_k = _relation_recall(pred_to_gt, topk)
+        pressure_recall[pressure_name].add(matched_by_k, len(ctx.gt_pair_set))
+        pressure_mean_recall[pressure_name].add(ctx.gt_rels, matched_sets_by_k)
 
         if "R" in enabled:
             recall_metric.add(matched_by_k, len(ctx.gt_pair_set))
@@ -685,6 +810,12 @@ def evaluate_sgg(
                 "gt_rel_count": int(ctx.gt_rels.size(0)),
                 "gt_pair_count": int(len(ctx.gt_pair_set)),
                 "pred_pair_count": int(ctx.pred_pair_idx.size(0)),
+                "semantic_candidate_count": int(graph_row["semantic_candidates"]),
+                "pressure_bucket": pressure_name,
+                "candidate_node_coverage": float(graph_row["candidate_node_coverage"]),
+                "degree_gini": float(graph_row["degree_gini"]),
+                "max_degree": int(graph_row["max_degree"]),
+                "label_pair_entropy": float(graph_row["label_pair_entropy"]),
                 "triplet_match_count": int(matched_by_k.get(best_k, 0)),
                 "triplet_recall": float(matched_by_k.get(best_k, 0) / max(len(ctx.gt_pair_set), 1)),
             }
@@ -696,6 +827,47 @@ def evaluate_sgg(
     else:
         mean_recall = {k: 0.0 for k in topk}
         per_predicate_recall = {k: {} for k in topk}
+
+    graph_statistics: Dict[str, float] = {}
+    if graph_image_stats:
+        for key in graph_image_stats[0]:
+            graph_statistics[f"avg_{key}"] = _safe_mean(
+                [row[key] for row in graph_image_stats]
+            )
+        graph_statistics["max_degree"] = max(
+            row["max_degree"] for row in graph_image_stats
+        )
+        graph_statistics["images"] = float(len(graph_image_stats))
+
+    pressure_stratified_metrics: Dict[str, Dict[str, object]] = {}
+    for name in pressure_bucket_names:
+        count_row = pressure_counts[name]
+        image_count = int(count_row["images"])
+        if image_count <= 0:
+            continue
+        bucket_recall = pressure_recall[name].finalize()
+        bucket_mean_recall, _ = pressure_mean_recall[name].finalize()
+        bucket_hmr = {}
+        for k in topk:
+            recall_value = float(bucket_recall.get(k, 0.0))
+            mean_value = float(bucket_mean_recall.get(k, 0.0))
+            bucket_hmr[k] = (
+                0.0
+                if recall_value + mean_value <= 0.0
+                else float(2.0 * recall_value * mean_value / (recall_value + mean_value))
+            )
+        pressure_stratified_metrics[name] = {
+            "images": image_count,
+            "semantic_candidates_avg": float(
+                count_row["semantic_candidates"] / image_count
+            ),
+            "final_candidates_avg": float(
+                count_row["final_candidates"] / image_count
+            ),
+            "R": bucket_recall,
+            "mR": bucket_mean_recall,
+            "HMR": bucket_hmr,
+        }
 
     return SGGResult(
         recall=recall,
@@ -732,4 +904,6 @@ def evaluate_sgg(
             }
             for predicate, total in vehicle_aux_total.items()
         },
+        graph_statistics=graph_statistics,
+        pressure_stratified_metrics=pressure_stratified_metrics,
     )

@@ -37,7 +37,7 @@ class STARDataset(BaseSGGDataset):
         num_im: int = -1,
         split_mode: str = "fixed",
         split_ratios: Sequence[int] = (6, 2, 2),
-        random_seed: int = 42,
+        random_seed: Optional[int] = None,
         fixed_split_source: Optional[str] = None,
         image_ext: str = ".png",
         tile_enabled: bool = False,

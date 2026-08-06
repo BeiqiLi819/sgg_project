@@ -189,7 +189,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build frozen sgdet detector proposal cache.")
     parser.add_argument("--config", default="configs/star_sgdet_obb_train.py")
     parser.add_argument("--split", default="train", help="Comma-separated splits, e.g. train,test")
-    parser.add_argument("--output-dir", default="outputs/star_sgdet_detection_cache_v5")
+    parser.add_argument("--output-dir", default="star_sgdet_detection_cache")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max-images", type=int, default=-1)
     parser.add_argument("--batch-size", type=int, default=1)

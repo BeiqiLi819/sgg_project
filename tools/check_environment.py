@@ -26,7 +26,24 @@ REQUIRED = {
     "h5py": ("h5py", "3.14.0"),
     "tqdm": ("tqdm", "4.65.2"),
     "mmcv-full": ("mmcv", "1.7.2"),
+    # Runtime dependencies imported by mmcv-full itself. They are pinned in
+    # requirements.clean.txt and checked here so a partial MMCV installation
+    # cannot pass the public Full-route environment audit.
+    "addict": ("addict", "2.4.0"),
+    "packaging": ("packaging", "24.2"),
+    "PyYAML": ("yaml", "6.0.2"),
+    "yapf": ("yapf", "0.43.0"),
 }
+
+FULL_ROUTE_MODULES = (
+    "configs.star_predcls_obb_full",
+    "configs.star_sgcls_obb_full",
+    "configs.star_sgdet_obb_full",
+    "sgg.data.build",
+    "sgg.engine.trainer",
+    "sgg.evaluation.sgg_eval",
+    "sgg.modeling.detectors.scene_graph_detector",
+)
 
 UNWANTED = (
     "maskrcnn_benchmark",
@@ -89,6 +106,8 @@ def inspect_environment(require_cuda: bool = False) -> tuple[dict, list[str]]:
         "cpu_smoke": False,
         "cuda_available": False,
         "cuda_smoke": False,
+        "roi_align_rotated_cpu_smoke": False,
+        "roi_align_rotated_cuda_smoke": False,
         "torch_cuda": None,
         "compiled_cuda": None,
         "compiler": None,
@@ -96,6 +115,7 @@ def inspect_environment(require_cuda: bool = False) -> tuple[dict, list[str]]:
     try:
         import torch
         from mmcv.ops import (
+            RoIAlignRotated,
             box_iou_rotated,
             get_compiler_version,
             get_compiling_cuda_version,
@@ -114,6 +134,24 @@ def inspect_environment(require_cuda: bool = False) -> tuple[dict, list[str]]:
         ops["cpu_smoke"] = bool(overlap.shape == (1, 1) and kept.shape[0] == 1 and indices.tolist() == [0])
         if not ops["cpu_smoke"]:
             failures.append("mmcv rotated-op CPU smoke test returned unexpected output")
+        roi_features = torch.arange(
+            64, dtype=torch.float32
+        ).reshape(1, 1, 8, 8)
+        rois = torch.tensor(
+            [[0.0, 4.0, 4.0, 4.0, 4.0, 0.0]], dtype=torch.float32
+        )
+        roi_align = RoIAlignRotated(
+            (2, 2), 1.0, 1, aligned=True, clockwise=False
+        )
+        roi_output = roi_align(roi_features, rois)
+        ops["roi_align_rotated_cpu_smoke"] = bool(
+            roi_output.shape == (1, 1, 2, 2)
+            and torch.isfinite(roi_output).all().item()
+        )
+        if not ops["roi_align_rotated_cpu_smoke"]:
+            failures.append(
+                "mmcv RoIAlignRotated CPU smoke test returned unexpected output"
+            )
         if ops["cuda_available"]:
             cuda_boxes = boxes.cuda()
             cuda_scores = scores.cuda()
@@ -126,6 +164,15 @@ def inspect_environment(require_cuda: bool = False) -> tuple[dict, list[str]]:
             )
             if not ops["cuda_smoke"]:
                 failures.append("mmcv rotated-op CUDA smoke test returned unexpected output")
+            cuda_roi_output = roi_align(roi_features.cuda(), rois.cuda())
+            ops["roi_align_rotated_cuda_smoke"] = bool(
+                cuda_roi_output.shape == (1, 1, 2, 2)
+                and torch.isfinite(cuda_roi_output).all().item()
+            )
+            if not ops["roi_align_rotated_cuda_smoke"]:
+                failures.append(
+                    "mmcv RoIAlignRotated CUDA smoke test returned unexpected output"
+                )
         elif require_cuda:
             failures.append("CUDA is required but torch.cuda.is_available() is false")
     except Exception as exc:  # pragma: no cover - error is reported to the caller
@@ -144,6 +191,54 @@ def inspect_environment(require_cuda: bool = False) -> tuple[dict, list[str]]:
     if newly_imported_legacy:
         failures.append(f"local OBB helpers imported legacy modules: {newly_imported_legacy}")
 
+    full_route_imports = {}
+    for module_name in FULL_ROUTE_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+            full_route_imports[module_name] = str(
+                getattr(module, "__file__", "<namespace>")
+            )
+        except Exception as exc:  # pragma: no cover - reported to caller
+            full_route_imports[module_name] = None
+            failures.append(
+                "Full train/test route import failed for "
+                f"{module_name}: {type(exc).__name__}: {exc}"
+            )
+
+    full_config_contract = {}
+    for module_name, expected_task in (
+        ("configs.star_predcls_obb_full", "predcls"),
+        ("configs.star_sgcls_obb_full", "sgcls"),
+        ("configs.star_sgdet_obb_full", "sgdet"),
+    ):
+        module = sys.modules.get(module_name)
+        if module is None or not hasattr(module, "cfg"):
+            continue
+        cfg = module.cfg
+        rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
+        contract = {
+            "task": cfg["MODEL"]["TASK"],
+            "predictor": rel_cfg["PREDICTOR"],
+            "relation_graph": rel_cfg["RPCM_RELATION_GRAPH_MODE"],
+            "train_validation_filter": rel_cfg["TEST_FILTER_METHOD"],
+            "rsgp_role_mode": rel_cfg["RSGP_ROLE_MODE"],
+        }
+        full_config_contract[expected_task] = contract
+        if contract["task"] != expected_task:
+            failures.append(
+                f"Full config task mismatch for {module_name}: {contract['task']}"
+            )
+        if contract["predictor"] != "RPCM_ORIGINAL_LEGACY":
+            failures.append(
+                f"Unexpected public Full predictor for {module_name}: "
+                f"{contract['predictor']}"
+            )
+        if contract["relation_graph"] != "dual_view":
+            failures.append(
+                f"Unexpected public Full relation graph for {module_name}: "
+                f"{contract['relation_graph']}"
+            )
+
     report = {
         "python": sys.version.split()[0],
         "executable": sys.executable,
@@ -151,6 +246,8 @@ def inspect_environment(require_cuda: bool = False) -> tuple[dict, list[str]]:
         "mmcv_ops": ops,
         "legacy_paths": contaminated_paths,
         "unwanted_packages": present_unwanted,
+        "full_route_imports": full_route_imports,
+        "full_config_contract": full_config_contract,
         "failures": failures,
     }
     return report, failures

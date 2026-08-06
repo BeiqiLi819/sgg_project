@@ -3,11 +3,19 @@ from __future__ import annotations
 import inspect
 from typing import Dict, Iterable, Optional
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 from .collate import sgg_collate_fn
 from .datasets import DATASETS
-from .transforms import Compose, NormalizeTransform, RandomDirectionalFlip, RandomOBBRotate, ResizeTransform
+from .grouped_batch_sampler import GroupedBatchSampler
+from .transforms import (
+    Compose,
+    NormalizeTransform,
+    RandomDirectionalFlip,
+    RandomOBBRotate,
+    ResizeTransform,
+    ShortEdgeResizeTransform,
+)
 
 
 def _sync_model_cfg_from_metadata(cfg: Dict, metadata) -> Dict:
@@ -56,7 +64,16 @@ def _build_dataset_kwargs(cfg: Dict, split: str) -> tuple[type, Dict]:
         for name, param in signature.parameters.items()
         if name != "self" and param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     }
-    transform_keys = {"IMAGE_SIZE", "KEEP_RATIO", "PIXEL_MEAN", "PIXEL_STD", "TO_RGB"}
+    transform_keys = {
+        "IMAGE_SIZE",
+        "KEEP_RATIO",
+        "RESIZE_MODE",
+        "MIN_SIZE",
+        "MAX_SIZE",
+        "PIXEL_MEAN",
+        "PIXEL_STD",
+        "TO_RGB",
+    }
     kwargs = {
         k.lower(): v
         for k, v in dcfg.items()
@@ -77,14 +94,23 @@ def _build_dataset_kwargs(cfg: Dict, split: str) -> tuple[type, Dict]:
 
 def _build_transforms(dcfg: Dict):
     transforms = []
+    resize_mode = str(dcfg.get("RESIZE_MODE", "fit")).strip().lower()
     image_size = dcfg.get("IMAGE_SIZE")
-    if image_size:
+    if resize_mode == "short_edge":
+        min_size = dcfg.get("MIN_SIZE")
+        max_size = dcfg.get("MAX_SIZE")
+        if min_size is None or max_size is None:
+            raise ValueError("short_edge resize requires DATASETS.*.MIN_SIZE and MAX_SIZE")
+        transforms.append(ShortEdgeResizeTransform(min_size=min_size, max_size=max_size))
+    elif resize_mode == "fit" and image_size:
         transforms.append(
             ResizeTransform(
                 tuple(int(v) for v in image_size),
                 keep_ratio=bool(dcfg.get("KEEP_RATIO", False)),
             )
         )
+    elif resize_mode not in {"fit", "none"}:
+        raise ValueError(f"Unsupported resize mode: {resize_mode}")
     if dcfg.get("AUGMENT", False):
         transforms.append(
             RandomDirectionalFlip(
@@ -164,15 +190,46 @@ def _build_dataloader_from_dataset(cfg: Dict, dataset, split: str, shuffle: bool
         batch_size = int(cfg["SOLVER"]["IMS_PER_BATCH"])
     elif split.lower() in {"val", "test"} and "IMS_PER_BATCH" in cfg.get("TEST", {}):
         batch_size = int(cfg["TEST"]["IMS_PER_BATCH"])
+    collate_fn = lambda batch: sgg_collate_fn(
+        batch,
+        size_divisible=lcfg.get("SIZE_DIVISIBLE", 0),
+    )
+    use_aspect_grouping = (
+        split.lower() == "train"
+        and bool(lcfg.get("ASPECT_RATIO_GROUPING", False))
+        and batch_size > 1
+    )
+    if use_aspect_grouping:
+        records = getattr(dataset, "records", None)
+        if records is None:
+            raise TypeError("ASPECT_RATIO_GROUPING requires a dataset with image-size records")
+        group_ids = [int(int(record["width"]) >= int(record["height"])) for record in records]
+        sampler = RandomSampler(dataset) if shuffle else SequentialSampler(dataset)
+        batch_sampler = GroupedBatchSampler(
+            sampler=sampler,
+            group_ids=group_ids,
+            batch_size=batch_size,
+            drop_last=False,
+        )
+        dcfg = cfg["DATASETS"][split.upper()]
+        print(
+            f"DataLoader[{split}]: batch_size={batch_size}, "
+            f"aspect_ratio_grouping=True, resize_mode={dcfg.get('RESIZE_MODE', 'fit')}, "
+            f"min_size={dcfg.get('MIN_SIZE')}, max_size={dcfg.get('MAX_SIZE')}",
+            flush=True,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=lcfg["NUM_WORKERS"],
+            collate_fn=collate_fn,
+        )
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=lcfg["NUM_WORKERS"],
-        collate_fn=lambda batch: sgg_collate_fn(
-            batch,
-            size_divisible=lcfg.get("SIZE_DIVISIBLE", 0),
-        ),
+        collate_fn=collate_fn,
     )
 
 

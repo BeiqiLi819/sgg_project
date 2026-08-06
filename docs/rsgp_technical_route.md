@@ -1,339 +1,316 @@
-# RSGP 技术路线：面向 STAR 遥感场景的 Pair Proposal 改进
+# RSGP Technical Route
 
-## 1. 当前结论
+> Paper-facing default: category-name-agnostic statistical RSGP
+> Legacy reproduction mode: `RSGP_ROLE_MODE=legacy_manual`
 
-当前实验表明，PPN 不能直接替换 PPG 作为测试阶段 pair filter。
+## 1. Method boundary
 
-在相同 relation checkpoint 下：
+Remote-sensing Graph-aware Pair Proposal (RSGP) is an inference-time candidate
+graph constructor. It does not update the detector, PPG, PPN, RPCM, or
+Dual-view RCA checkpoint.
 
-```text
-PPG: R@2000=0.6919, mR@2000=0.4417, HMR@2000=0.5392, final coverage=0.7989
-PPN: R@2000=0.6884, mR@2000=0.4350, HMR@2000=0.5331, final coverage=0.9124
+The only data preparation is a deterministic pass over the STAR `train`
+annotations to build class structural profiles, predicate frequencies, and
+rarity support. This pass has no optimizer, epoch, gradient, or learned
+network parameter. Validation selects the RSGP configuration; test never
+updates the prior.
+
+Given the semantic-valid directed pair set \(\mathcal E_0\), RSGP searches for
+a fixed-budget graph:
+
+\[
+\max_{\mathcal E\subseteq\mathcal E_0}
+\sum_{(i,j)\in\mathcal E}S_{ij},
+\]
+
+\[
+|\mathcal E|\le K,\quad
+d_{out}(i)\le D_o,\quad
+d_{in}(j)\le D_i,\quad
+n_{l_i,l_j}\le Q.
+\]
+
+The central claim is not that RSGP maximizes isolated pair recall. It builds a
+candidate graph whose evidence, degree distribution, and semantic diversity
+are compatible with downstream relation message passing.
+
+## 2. Category-name-agnostic structural prior
+
+The paper-facing implementation never matches class-name strings and never
+stores a hand-written predicate ID list. A one-time preprocessing pass reads
+only the training split:
+
+```bash
+bash scripts/build_rsgp_structural_prior.sh
 ```
 
-核心判断：
-
-- PPN 的 GT pair coverage 更高，但 downstream triplet recall 更低。
-- 因此问题不是简单的“pair 是否进入候选”，而是候选图质量是否适合后续 RPCM 关系分类。
-- 新方法不应只优化 pair recall，而应优化最终 `R/mR/HMR@1500/2000`。
-
-PPG 和 PPN 在当前流程中均只作为测试阶段 pair filter，不参与 relation head 的训练。
-
-## 2. 方法目标
-
-新方法命名为：
+Default output:
 
 ```text
-Remote-sensing Graph-aware Pair Proposal (RSGP)
+pretrained/rsgp_structural_prior.json
 ```
 
-目标：
+For every object class \(c\), it records:
+
+\[
+\rho_c=\frac{1}{2}\mathbb E[q(A_i)]
++\frac{1}{2}\mathbb E[\operatorname{contain}(i)],
+\]
+
+\[
+\alpha_c=\mathbb E\left[
+1-\frac{\min(w_i,h_i)}{\max(w_i,h_i)}
+\right],
+\]
+
+\[
+\kappa_c=\mathbb E\left[
+\frac{\log(1+d_i)}{\log(1+N_i)}
+\right].
+\]
+
+These are soft contextual-region, directional-alignment, and
+relational-connectivity profiles. Class IDs index the profile table, but class
+names never participate in scoring.
+
+The JSON stores its train split, build-configuration hash, metadata order
+hash, annotation-content signature, payload hash, profile vectors, predicate
+frequencies, and rarity-pair support. Missing files, payload corruption, or
+class/predicate order mismatch terminate evaluation instead of silently
+reverting to manual rules.
+
+## 3. Generic structural kernels
+
+### 3.1 OBB geometry
+
+The class-independent geometry proxy combines axis-aligned envelope IoU,
+normalized center distance, pair compactness, and OBB-axis consistency:
+
+\[
+S^{geom}_{ij}
+=0.35IoU^{env}_{ij}
++0.30e^{-\bar d_{ij}}
++0.20c^{compact}_{ij}
++0.15|\cos\Delta\theta_{ij}|.
+\]
+
+This is an axis-aligned envelope proxy, not exact rotated IoU.
+
+### 3.2 Context association
+
+At inference, training context profile and current image area rank form a
+preliminary carrier score. RSGP retains:
+
+\[
+M=\min(128,\max(16,\lceil2\sqrt N\rceil))
+\]
+
+carrier candidates. Exact OBB containment and distance are computed only in an
+\(N\times M\) workspace. Each entity is softly assigned to its best carrier,
+and the pair score preserves both shared-carrier and different-carrier
+possibilities.
+
+### 3.3 Directional alignment
+
+The class alignment profile is averaged with current OBB elongation. Its pair
+gate weights:
+
+- OBB-axis parallelism;
+- displacement along the subject axis;
+- displacement lateral to the subject axis.
+
+It is evaluated for all semantic-valid pairs and has no vehicle-class gate.
+
+### 3.4 Local connectivity
+
+The class connectivity profile is averaged with current semantic-candidate
+degree. The resulting soft gate weights normalized proximity:
+
+\[
+S^{connect}_{ij}
+=\sqrt{g_i^kg_j^k}\exp(-0.5\bar d_{ij}).
+\]
+
+It has no network-class gate.
+
+## 4. Frequency-adaptive compatibility
+
+Fixed hard-predicate IDs are replaced with training frequency:
+
+\[
+\omega_r=(f_r+\epsilon)^{-0.5}.
+\]
+
+After normalization by the maximum active rarity weight:
+
+\[
+S^{rare}_{ij}
+=\max_{r:F(l_i,l_j,r)=1}\widetilde{\omega}_r.
+\]
+
+This protects semantically compatible pairs that may express infrequent
+predicates without naming those predicates.
+
+## 5. Multi-source scoring and constrained selection
+
+RSGP pools:
 
 ```text
-生成更适合遥感关系和当前 RPCM dense rel-rel GCN 的候选关系图。
+PPG top-10000 precision candidates
+PPN top-12000 recall-completion candidates
+structural-score top-12000 candidates
 ```
 
-第一版范围：
+Its final score is:
 
-- 只做测试阶段 filter。
-- 不修改训练流程。
-- 不修改 relation head。
-- 不重训 checkpoint。
-- 默认使用当前 `tail_aux` 最优 checkpoint。
+\[
+S_{ij}=
+w_p\hat S^{PPG}_{ij}
++w_n\hat S^{PPN}_{ij}
++w_g\hat S^{geom}_{ij}
++w_c\hat S^{context}_{ij}
++w_a\hat S^{align}_{ij}
++w_k\hat S^{connect}_{ij}
++w_rS^{rare}_{ij}
++w_d\hat S^{balance}_{ij}.
+\]
 
-当前主模型：
+Defaults:
 
 ```text
-CONFIG=configs/star_predcls_obb_tail_aux_train.py
-CHECKPOINT=outputs/star_predcls_obb_tail_aux/best_bgfirst.pth
+(wp, wn, wg, wc, wa, wk, wr, wd)
+= (1.0, 0.35, 0.35, 0.25, 0.10, 0.10, 0.15, 0.15)
 ```
 
-## 3. RSGP 默认流程
-
-默认推理流程：
+Selection order:
 
 ```text
 semantic filter
-→ PPG protected pool
-→ PPN recall completion pool
-→ RS geometry/topology scoring
-→ degree/label-pair quota greedy selection
+→ PPG protected top-P, P in {7000, 8000, 9000}
+→ PPN recall-completion top-12000
+→ generic structural top-12000
+→ hybrid ranking
+→ degree capacity 96/96
+→ semantic-type capacity 800
+→ relaxed capacity 128/1200
 → final top-10000
 → RPCM
 ```
 
-设计原则：
+The paper validation grid compared 7000/8000/9000 and selected \(P=9000\).
+After selection, the base configs and public wrappers were frozen to 9000;
+`selection.json` remains the provenance record. The old manual route happened
+to favor 8000/2000, but that does not preselect the statistical route.
 
-- 保留 PPG 的高精度候选图先验。
-- 用 PPN 补充 PPG 漏掉的高召回候选。
-- 用遥感几何、锚点、局部拓扑和长尾关系先验重新排序。
-- 用图约束控制候选图密度，避免干扰 RPCM dense rel-rel GCN。
+## 6. Runtime modes
 
-## 4. 遥感先验模块
+Paper-facing mode:
 
-### 4.1 OBB geometry expert
-
-用于建模几何交互类关系，例如：
-
-```text
-over
-adjacent
-through
-converge
-intersect
-run along
-not run along
-pass across
-pass under
+```bash
+RSGP_ROLE_MODE=statistical \
+RSGP_STRUCTURAL_PRIOR_PATH=pretrained/rsgp_structural_prior.json \
+FILTER_METHOD=RSGP \
+bash scripts/_internal/eval_star_predcls.sh
 ```
 
-建议特征：
+Historical replay:
 
-- rotated IoU
-- 归一化中心距离
-- 面积比
-- union compactness
-- 主轴夹角
-- 中心连线与主轴夹角
-- 投影重叠长度
-
-### 4.2 Anchor / shared-different expert
-
-用于建模区域锚点类关系，例如：
-
-```text
-parking in the same apron with
-parking in the different apron with
-docking at the same dock with
-docking at the different dock with
-in the same parking with
-in the different parking with
+```bash
+RSGP_ROLE_MODE=legacy_manual \
+FILTER_METHOD=RSGP \
+bash scripts/_internal/eval_star_predcls.sh
 ```
 
-默认 anchor 类：
+In statistical mode the following legacy fields are ignored:
 
 ```text
-apron
-truck_parking
-car_parking
-dock
-runway
-taxiway
-breakwater
-goods_yard
+RSGP_ANCHOR_CLASSES
+RSGP_VEHICLE_CLASSES
+RSGP_NETWORK_CLASSES
+RSGP_TAIL_PREDICATES
 ```
 
-不存在的类别自动忽略。
+## 7. Validation protocol
 
-候选特征：
+The relation checkpoint is the validation-selected checkpoint from the
+controlled PredCls DL row. All RSGP/PPG/PPN cases reuse that exact checkpoint,
+the same Semantic Filter, and the fixed top-10,000 output budget.
 
-- subject/object 到 anchor 的 nearest/enclosing assignment
-- same-anchor confidence
-- different-anchor confidence
-- anchor 类型匹配度
+Run validation-only mode selection:
 
-### 4.3 Vehicle motion / lane topology expert
+```bash
+bash scripts/research/select_predcls_rsgp_on_val.sh
+```
 
-用于车辆运动和车道类关系，例如：
+The grid contains PPG and PPN references, statistical RS-only, PPN-graph, and
+Hybrid 9000/1000, 8000/2000, and 7000/3000. A legacy-manual replay may be
+generated for audit, but it is not eligible to become the paper-facing
+statistical result.
+
+Run statistical component ablations:
+
+```bash
+bash scripts/research/eval_predcls_rsgp_ablation.sh FULL
+bash scripts/research/eval_predcls_rsgp_ablation.sh LEGACY_MANUAL
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_PPN
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_GEOMETRY
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_STRUCTURE
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_DEGREE
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_QUOTA
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_RARITY
+```
+
+Freeze a statistical configuration only if validation HMR exceeds PPG and
+R@2000 falls by no more than 0.2 percentage points. Test is run once after
+freezing. `eval_rsgp_grid.sh` records the qualifying cases and the
+highest-HMR choice in `selection.json`; an empty `selected` field means that
+statistical RSGP has not passed the paper acceptance rule. The exact task
+checkpoint must be reused for every filter.
+
+The completed validation grid selected Hybrid 9000/1000. A second val-only
+check at that fixed pool split retained the three statistical structural-role
+kernels: Full reached R/mR/HMR@2000 = 0.6302/0.4231/0.5063, versus
+0.6282/0.4211/0.5042 without the contextual, alignment, and connectivity
+roles. This freezes the final method with all statistical components enabled;
+test remove-one results are diagnostic and cannot override this decision.
+
+## 8. Candidate-graph and pressure evidence
+
+Every final PPG/PPN/RSGP JSON should be compared using:
+
+- final relation-row-weighted GT-pair coverage;
+- candidate-node coverage;
+- average degree Gini and split-wide maximum degree;
+- average label-pair entropy;
+- R/mR/HMR under the same candidate-pressure group.
+
+Pressure is defined by the Semantic-Filter candidate count before pair
+top-10,000 selection:
 
 ```text
-driving in the same lane with
-driving in the different lane with
-driving in the same direction with
-driving in the opposite direction with
-driving alongside with
-within safe distance of
-within danger distance of
+no truncation:   <= 10,000
+low overload:    10,001--20,000
+medium overload: 20,001--50,000
+high overload:   > 50,000
 ```
 
-STAR 数据集没有道路/车道标注，因此不应依赖 road anchor。
+`No truncation` only means that pair filtering does not discard a
+semantic-valid pair. Triplets are still ranked at top-1000/1500/2000.
+Pressure-group mR remains a macro statistic over the fixed predicate
+vocabulary and is affected by group composition. The claim therefore comes
+from same-group PPG-versus-RSGP comparison, not from requiring monotonic
+performance across groups.
 
-建议使用车辆 OBB 本身推断 lane-like topology：
+## 9. Legacy result boundary
 
-- 局部 kNN
-- OBB 主轴方向聚类
-- 沿主轴投影距离
-- 横向 offset
-- 方向差
-- 局部线性排列置信度
+All previously reported RSGP numbers were generated by the manual semantic
+groups and fixed hard-predicate list. They are now named
+`RSGP-v1/legacy_manual` and remain useful only as route-development evidence.
+They cannot be relabeled as category-name-agnostic statistical RSGP.
 
-### 4.4 Network path expert
+The new method may claim:
 
-用于网络/连通类关系，例如：
+> category-name-agnostic structural roles derived from training statistics.
 
-```text
-directly connected to
-indirectly connected to
-directly transmit electricity to
-indirectly transmit electricity to
-within same line of
-within different line of
-```
-
-建议构建局部图：
-
-- kNN graph
-- radius graph
-- minimum spanning forest
-- 1-hop direct candidate
-- 2/3-hop indirect candidate
-- connected-component same/different line signal
-
-### 4.5 Tail relation quota / bias
-
-用于保护低召回关系，例如：
-
-```text
-not run along
-not parked alongside with
-not docked alongside with
-driving in the same lane with
-driving in the different lane with
-driving alongside with
-within danger distance of
-indirectly connected to
-indirectly transmit electricity to
-not working on
-```
-
-该模块只提供小幅 bonus 或 quota，不应覆盖主排序。
-
-## 5. RPCM 适配原则
-
-当前 relation base 忠实采用 `6850_4135.pth` 对应的 RPCM 版本：每个
-predicate 使用一个 GloVe prototype，`proto_ema` 是静态初始化锚点；GNN
-分别在 shared-subject 和 shared-object 两个 dense relation view 上传递
-信息，迭代 4 次并对输入层及全部更新层取均值。RSGP 不修改这些 relation
-head 规则，只改变送入 RPCM 的候选边集合。
-
-候选 pair 数和图拓扑会直接影响：
-
-```text
-pred_pred_subj = subj_pred_map.T @ subj_pred_map
-pred_pred_obj  = obj_pred_map.T  @ obj_pred_map
-```
-
-因此 RSGP 必须控制候选图密度。
-
-必须遵守：
-
-- 控制 dense rel-rel GCN 的候选图规模。
-- 控制 max in-degree / max out-degree。
-- 控制 label-pair quota。
-- 控制局部 component density。
-- 不以 pair coverage 作为唯一目标。
-
-默认约束建议：
-
-```text
-RSGP_TOPK = 10000
-RSGP_MAX_OUT_DEGREE = 96
-RSGP_MAX_IN_DEGREE = 96
-RSGP_LABEL_PAIR_QUOTA = 800
-```
-
-若候选不足，可第二轮放宽：
-
-```text
-max degree: 96 -> 128
-label-pair quota: 800 -> 1200
-```
-
-## 6. 第一轮实验矩阵
-
-统一设置：
-
-```text
-CONFIG=configs/star_predcls_obb_tail_aux_train.py
-CHECKPOINT=outputs/star_predcls_obb_tail_aux/best_bgfirst.pth
-TEST_BATCH_SIZE=1
-VAL_BATCH_SIZE=1
-```
-
-对比方法：
-
-```text
-PPG 10000
-PPN 10000
-RSGP RS_ONLY
-RSGP PPN_GRAPH
-RSGP HYBRID 9000/1000
-RSGP HYBRID 8000/2000
-RSGP HYBRID 7000/3000
-```
-
-当前实现入口：
-
-```text
-TEST_FILTER_METHOD / FILTER_METHOD = RSGP
-RSGP_MODE = RS_ONLY | PPN_GRAPH | HYBRID
-scripts/eval_rsgp_grid.sh
-```
-
-filter 行为统一由 `TEST_FILTER_METHOD` 控制。`PPG_ENABLED`、`PPN_ENABLED`、`RSGP_ENABLED`
-只作为旧配置兼容字段保留，不作为运行时主开关。
-
-其中 HYBRID 的含义是：
-
-```text
-PPG protected pool + PPN completion pool
-```
-
-例如：
-
-```text
-RSGP HYBRID 8000/2000
-```
-
-表示优先保留最多 8000 条 PPG 高置信候选，再用 PPN/RS scoring 补充最多 2000 条候选。
-
-## 7. 验收标准
-
-以 PPG baseline 为目标：
-
-```text
-PPG R@2000   = 0.6919
-PPG mR@2000  = 0.4417
-PPG HMR@2000 = 0.5392
-```
-
-第一阶段接受标准：
-
-```text
-R@2000 >= 0.690
-mR@2000 > 0.4417
-HMR@2000 > 0.5392
-```
-
-必须同时报告：
-
-- `R/mR/HMR@1500/2000`
-- final GT pair coverage
-- per-predicate recall
-- per-predicate candidate coverage
-- 平均/最大 in-degree
-- 平均/最大 out-degree
-- PPG/PPN/RSGP edge overlap
-- hardest images
-
-## 8. 后续方向
-
-若 inference-only RSGP 有收益，再考虑训练新的 proposal network。
-
-训练目标不应只是 pairness BCE，而应包含：
-
-```text
-L = GT pair BCE
-  + PPG rank distillation
-  + class-balanced coverage loss
-  + degree regularization
-  + frozen-RPCM-aware ranking loss
-```
-
-其中 PPG rank distillation 的目的不是复现 PPG，而是保留 PPG 在测试阶段体现出的候选图先验。
-
-长期目标：
-
-```text
-让 pair proposal 直接服务 downstream R/mR/HMR，而不是单独最大化 pair recall。
-```
+It must not claim cross-dataset generalization until another dataset is
+evaluated.

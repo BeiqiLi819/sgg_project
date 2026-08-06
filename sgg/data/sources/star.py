@@ -92,7 +92,7 @@ class STARSource:
         box_mode: str = "hbb",
         split_mode: str = "fixed",
         split_ratios: Sequence[int] = (6, 2, 2),
-        random_seed: int = 42,
+        random_seed: Optional[int] = None,
         filter_empty_relations: bool = True,
         filter_non_overlap: bool = False,
         num_im: int = -1,
@@ -135,7 +135,7 @@ class STARSource:
         box_mode: str,
         split_mode: str,
         split_ratios: Sequence[int],
-        random_seed: int,
+        random_seed: Optional[int],
         filter_empty_relations: bool,
         filter_non_overlap: bool,
         num_im: int,
@@ -260,7 +260,7 @@ def _select_split_indices(
     num_images: int,
     split_mode: str,
     split_ratios: Sequence[int],
-    random_seed: int,
+    random_seed: Optional[int],
 ) -> List[int]:
     if split_mode == "random":
         train_idx, val_idx, test_idx = _random_split(num_images, ratios=split_ratios, seed=random_seed)

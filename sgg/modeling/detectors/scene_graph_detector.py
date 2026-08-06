@@ -139,7 +139,7 @@ class SceneGraphDetector(nn.Module):
         cache_cfg = dict(sgdet_cfg.get("DETECTION_CACHE", {}))
         self.sgdet_detection_cache_enabled = bool(cache_cfg.get("ENABLED", False))
         self.sgdet_detection_cache_dir = Path(
-            str(cache_cfg.get("DIR", "outputs/star_sgdet_detection_cache_v5"))
+            str(cache_cfg.get("DIR", "star_sgdet_detection_cache"))
         )
         self.sgdet_detection_cache_require_hit = bool(cache_cfg.get("REQUIRE_HIT", True))
         self.sgdet_detection_cache_hash = str(cache_cfg.get("HASH", "") or "")

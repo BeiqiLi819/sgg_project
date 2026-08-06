@@ -172,7 +172,7 @@ def main() -> None:
         )
     )
     parser.add_argument("--config", default="configs/star_sgdet_obb_train.py")
-    parser.add_argument("--cache-dir", default="outputs/star_sgdet_detection_cache_v5")
+    parser.add_argument("--cache-dir", default="star_sgdet_detection_cache")
     parser.add_argument("--splits", default="train,test")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

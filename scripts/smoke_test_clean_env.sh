@@ -9,9 +9,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-CONFIG="${CONFIG:-configs/star_predcls_obb_tail_aux_train.py}"
-CHECKPOINT="${CHECKPOINT:-outputs/star_predcls_obb_tail_aux/best.pth}"
-FILTER_METHOD="${FILTER_METHOD:-PPG}"
+CONFIG="${CONFIG:-configs/star_predcls_obb_full.py}"
+CHECKPOINT="${CHECKPOINT:-pretrained/full/STAR_OBB_Full_PredCls.pth}"
+FILTER_METHOD="${FILTER_METHOD:-RSGP}"
 MAX_IMAGES="${MAX_IMAGES:-2}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/environment_smoke_test}"
 OUTPUT_JSON="${OUTPUT_JSON:-${OUTPUT_DIR}/test_metrics.json}"
@@ -23,6 +23,17 @@ fi
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "Smoke-test checkpoint not found: ${CHECKPOINT}" >&2
   exit 1
+fi
+if [[ "${FILTER_METHOD^^}" == "RSGP" ]]; then
+  for asset in \
+    pretrained/STAR_OBB.pth \
+    pretrained/PPN_OBB.pth \
+    pretrained/rsgp_structural_prior.json; do
+    if [[ ! -f "${asset}" ]]; then
+      echo "Full RSGP smoke-test asset not found: ${asset}" >&2
+      exit 1
+    fi
+  done
 fi
 
 mkdir -p "${OUTPUT_DIR}"
@@ -51,4 +62,3 @@ fi
 
 echo
 echo "Smoke test passed. Metrics: ${OUTPUT_JSON}"
-

@@ -1,1444 +1,1411 @@
-# 论文主要贡献、创新点与实验记录
+# 论文方法、贡献与实验记录
 
-> Status: working draft for paper writing  
-> Last updated: 2026-07-22  
-> Dataset/task scope: STAR, OBB, PredCls/SGCls/SGDet  
-> Reference baseline: SGG-ToolKit implementation and the STAR paper  
-> Result unit in all tables: percentage (%)
+> Status: paper working draft
+>
+> Last updated: 2026-08-04
+>
+> Scope: STAR, OBB, PredCls/SGCls/SGDet
+>
+> Reference baseline: STAR paper and SGG-ToolKit
+>
+> Table unit: percentage (%)
 
-本文档固定当前工作的论文边界、方法叙述、实验协议和结果来源。标记为 **TBD** 的位置需要后续实验填写；标记为 **existing** 的结果已能从当前日志或 JSON 中复现。最终投稿前，应统一 checkpoint 选择方式和评估脚本后再冻结数字。
+本文档是当前论文方法、实验设置和结果来源的主记录。最终执行协议以
+[submission_experiment_protocol.md](submission_experiment_protocol.md) 为准，
+RSGP 的实现细节以 [rsgp_technical_route.md](rsgp_technical_route.md) 为准。
+可直接复制到论文并已区分正文/附录的精简稿位于
+[paper_ready_manuscript.md](paper_ready_manuscript.md)。
 
----
-
-## 1. 一句话定位
-
-针对大幅遥感图像中实体数量多、候选关系图稠密、关系类别分布不均且不同实体角色具有非对称语义的问题，本文在 STAR 的 OBB 场景图生成框架上提出一种由 **遥感图感知候选关系筛选（RSGP）**、**角色感知边视角上下文传播（Role-aware RCA）** 和 **困难谓词残差校准（Hard-Predicate Residual Calibration, HPRC）** 组成的方法，在控制候选图规模的同时提升整体召回率与类别均衡召回率。
-
-可用英文表述：
-
-> We present a remote-sensing-oriented scene graph generation framework that jointly improves candidate graph construction and predicate reasoning through graph-aware pair proposal, role-aware relation context propagation, and hard-predicate residual calibration.
-
----
-
-## 2. 与 STAR/SGG-ToolKit 的边界
-
-### 2.1 STAR 原工作已经具备的内容
-
-以下内容来自 STAR 原工作，不能作为本文首创：
-
-- STAR 数据集、48 个前景实体类别和 58 个前景关系类别；
-- HBB/OBB 三项标准任务：PredCls、SGCls 和 SGDet；
-- HOD-Net/OBB detector 以及大图多尺度 patch 检测流程；
-- PPG（Pair Proposal Generator）及其 top-10,000 pair filtering；
-- RPCM 中的对象上下文增强、关系上下文增强和 prototype matching；
-- RPCM 中已有的 relation-to-relation 信息传播。
-
-因此，本文不能使用“首次在 STAR 中引入关系边之间的 GNN”或“首次进行 relation-to-relation message passing”之类的表述。
-
-### 2.2 本文真正改变的部分
-
-本文相对 SGG-ToolKit/STAR 的变化集中在：
-
-1. 不再把 pair proposal 仅视为 GT pair recall 最大化问题，而是将其视为面向下游关系推理的候选图构建问题；
-2. 将原本合并的关系邻接拆分为 shared-subject 和 shared-object 两个角色视角，防止跨角色共享实体引入不加区分的上下文；
-3. 提出 HPRC：保留主 CE 分类目标，以小权重 logit-adjust 辅助项校正类别先验，并用轻量残差校准头修正持续低召回或高混淆的谓词，避免完全改成多标签或强重加权后导致主召回率下降；
-4. 在统一 OBB detector 语义、角度、NMS 和评估协议后，扩展并验证 PredCls、SGCls、SGDet 三项任务。
-
-### 2.3 不建议作为算法贡献的内容
-
-- detector background 通道重排、OBB angle/offset 修复属于复现和兼容性修正；
-- 忠实移植 RPCM predictor 属于 baseline/reproduction infrastructure；
-- PPN 可以作为 RSGP 的 recall-completion 分支，但单独 PPN 是否构成贡献需要视论文叙述和训练方法而定。
-
----
-
-## 3. 论文主要贡献（可直接用于 Introduction）
-
-### Contribution 1: Remote-sensing Graph-aware Pair Proposal
-
-提出 **Remote-sensing Graph-aware Pair Proposal（RSGP）**。不同于只按独立 pair score 排序的 PPG/PPN，RSGP 同时考虑：
-
-- PPG 的高精度候选；
-- PPN 的高覆盖候选；
-- OBB 距离、交叠、紧致度和主轴方向等遥感几何先验；
-- apron、dock、parking、runway/taxiway 等共享/不同锚点结构；
-- vehicle motion/lane 和 functional network topology；
-- hard-predicate-supported label pairs；
-- 节点入度、出度和 label-pair quota。
-
-RSGP 在固定 top-10,000 预算下生成更适合 RPCM 上下文传播的候选关系图。现有结果显示，PPN 虽然获得更高的 GT pair coverage，但其下游 R/mR/HMR 低于 PPG 和 RSGP，说明单纯优化 pair coverage 并不能保证 scene graph recall。
-
-可用英文贡献句：
-
-> We propose RSGP, a remote-sensing graph-aware pair proposal strategy that combines high-precision and high-recall proposal sources with OBB geometry and graph-level degree/label-pair constraints, optimizing the candidate graph for downstream predicate reasoning rather than pair recall alone.
-
-### Contribution 2: Role-aware Relation Context Aggregation
-
-提出 **role-aware dual-view relation context aggregation**。对于候选关系边
-
-\[
-e_i=(s_i,o_i),
-\]
-
-分别构造 shared-subject 和 shared-object 邻接：
-
-\[
-A^{s}_{ij}=\mathbb{1}[s_i=s_j], \qquad
-A^{o}_{ij}=\mathbb{1}[o_i=o_j].
-\]
-
-两个视角共享 GNN 参数，但分别进行消息传播，随后与 subject-to-relation 和 object-to-relation 消息融合：
-
-\[
-h_i^{(l+1)}=\frac{1}{4}\left(
-m_{s\rightarrow r,i}^{(l)}+
-m_{o\rightarrow r,i}^{(l)}+
-m_{r_s\rightarrow r,i}^{(l)}+
-m_{r_o\rightarrow r,i}^{(l)}
-\right).
-\]
-
-STAR/SGG-ToolKit 的统一邻接将任意共享端点及 subject-object 跨角色匹配合并到同一 relation graph。本文的创新不在于“有 relation GNN”，而在于显式保留实体在关系中的 subject/object 角色，减少跨角色上下文混叠。
-
-可用英文贡献句：
-
-> We introduce a role-aware relation context module that decouples shared-subject and shared-object relation graphs, preserving endpoint semantics that are discarded by unified relation adjacency.
-
-### Contribution 3: Hard-Predicate Residual Calibration
-
-提出 **Hard-Predicate Residual Calibration（HPRC）**。针对 STAR 显著的类别不均衡以及近义、反义关系混淆，采用“稳定主分类器 + 弱频率先验校准 + 困难谓词残差修正”的训练方式：
-
-\[
-\mathcal{L}_{rel}
-=\operatorname{CE}(z,y)
-+\lambda_{LA}\operatorname{CE}(z+\tau\log \pi,y),
-\]
-
-其中主 CE 保持原关系分类器的判别能力，logit-adjust auxiliary loss 以较小权重改善类别先验偏置。HPRC 的残差校准头对根据训练频率、历史验证召回和系统性混淆确定的困难谓词进行轻量修正：
-
-\[
-z'_c=z_c+\alpha z^{HPRC}_c,
-\qquad
-\alpha=\tanh(a)\alpha_{\max},
-\]
-
-并用带 `pos_weight` 的 BCE 训练校准 logits。由于融合 scale 从 0 初始化，模型初始行为与原分类器一致，降低对总体 R 的破坏风险。这里使用“困难谓词”而不是简单的“尾类”，因为被校准集合既包含低频关系，也包含 `same/different lane` 等样本量不低但长期低召回的关系。
-
-可用英文贡献句：
-
-> We introduce Hard-Predicate Residual Calibration (HPRC), which combines weak prior-aware logit adjustment with a zero-initialized residual calibration head to correct systematically under-recognized predicates without replacing the stable relation classifier.
-
-### Contribution 4（可选）: Complete OBB SGG Evaluation Pipeline
-
-在统一的 OBB detector、类别通道、旋转角度、NMS 和指标实现下完成 PredCls、SGCls、SGDet 三项任务。
-
-该项更适合作为“完整实验与可复现性贡献”，不应替代前三项算法贡献。
-
-### 3.5 Contribution-to-evidence matrix
-
-| Claim | Required evidence | Current evidence boundary |
-|---|---|---|
-| Role-aware relation GNN is a distinct RPCM base relative to SGG-ToolKit | Code-level topology/update comparison and the reproduced 6850 checkpoint | Method distinction is established; an isolated causal gain over the paper GNN is **not** claimed without a controlled retraining |
-| HPRC improves class-balanced predicate recognition | Compare the 6850 PPG checkpoint with its warm-started HPRC descendant | Existing comparison supports the **combined HPRC stage**, not separate LA-only or residual-head-only causal effects |
-| RSGP improves downstream graph reasoning | Same relation checkpoint, only inference filter differs | Existing PPG vs RSGP evaluations form a strict inference-time comparison |
-| Higher pair coverage is not sufficient | PPN coverage is higher but triplet metrics are lower | PPG/PPN/RSGP graph-quality table |
-| RSGP components are necessary | Remove one component at a time | RSGP component ablation |
-| Improvements generalize beyond PredCls | Same task checkpoint evaluated with PPG and RSGP | SGCls/SGDet cross-task test |
-
----
-
-## 4. 方法总体结构
+当前主方法固定为：
 
 ```text
-OBB entities / detections
-        │
-        ▼
-Semantic Filter
-        │
-        ▼
-RSGP candidate graph
-  ├─ PPG protected pool
-  ├─ PPN completion pool
-  ├─ OBB geometry / anchor / topology priors
-  └─ degree and label-pair constrained selection
-        │
-        ▼
-Pairwise and union visual features
-        │
-        ▼
-Role-aware dual-view relation GNN
-  ├─ entity → relation
-  ├─ shared-subject relation → relation
-  └─ shared-object relation → relation
-        │
-        ▼
-Prototype predicate classifier
-        │
-        ├─ CE + weak logit-adjust auxiliary loss
-        └─ zero-initialized HPRC head
-        │
-        ▼
-Scene graph triplets
+role-aware dual-view RCA
++ auxiliary logit adjustment (LA)
++ statistical RSGP
 ```
 
-### 4.1 Problem formulation
+HPRC/`tail_aux` 和基于手工类别组的 RSGP-v1 不属于当前投稿方法。它们的
+checkpoint 兼容代码与历史结果可以保留，但不能改名为当前方法的结果。
 
-给定一幅遥感图像中的实体集合
+---
+
+## 1. 论文定位与贡献边界
+
+### 1.1 一句话定位
+
+针对大幅遥感图像中候选实体对数量庞大、关系边的 subject/object 角色容易在
+统一邻接中混叠、谓词分布不均的问题，本文提出一种由角色感知双视角关系聚合、
+弱先验校准和固定预算候选图构建组成的 OBB 场景图生成框架。
+
+英文表述：
+
+> We present a remote-sensing-oriented scene graph generation framework that
+> combines role-aware dual-view relation context aggregation, weak
+> prior-aware predicate supervision, and budget-constrained candidate-graph
+> construction.
+
+### 1.2 STAR/SGG-ToolKit 已有内容
+
+以下内容属于 STAR 原工作或 SGG-ToolKit，不作为本文创新：
+
+- STAR 数据集、48 个前景实体类别和 58 个前景关系类别；
+- OBB PredCls、SGCls 和 SGDet 三项任务；
+- Swin-L OBB detector 和大图多尺度 patch 检测；
+- Semantic Filter、PPG 和 top-10,000 pair budget；
+- RPCM 的 pair/union feature、对象与关系上下文、GloVe prototype classifier；
+- RPCM 已有的 relation-to-relation 信息传播。
+
+因此，论文不能声称“首次在 STAR 中引入 GNN”或“首次进行边到边传播”。
+
+### 1.3 本文真正改变的部分
+
+1. 将关系边图拆为 shared-subject 与 shared-object 两个角色视角，并在相同
+   RCA 更新模块中分别传播；
+2. 保留主 CE 分类目标，只增加小权重 logit-adjust auxiliary loss；
+3. 将 pair proposal 从独立 pair 排序改写为固定预算下的有向候选子图选择；
+4. 用 train split 自动统计的软结构角色替代 STAR 类名和手工 predicate ID；
+5. 在统一 OBB detector、类别通道、角度、NMS 和 evaluator 后完成三项任务。
+
+detector background 通道重排、OBB angle/offset、bbox coder、late NMS 和
+detection cache 属于兼容性与实验基础设施，不作为算法贡献。
+
+### 1.4 主要贡献
+
+**Contribution 1 — Role-aware dual-view RCA.**
+
+在关系边视角上显式区分 shared-subject 与 shared-object 邻接，避免统一
+relation graph 将不同端点角色混合为同一种消息。
+
+**Contribution 2 — Auxiliary LA.**
+
+在 prototype CE 之外加入弱 logit adjustment 监督，以训练集 predicate prior
+改善类别不均衡；推理分类器和 logits 不被手工修改。LA 是已有思想的稳定集成，
+不单独宣称为全新损失。
+
+**Contribution 3 — RSGP.**
+
+提出 Remote-sensing Graph-aware Pair Proposal，将候选筛选表述为带 degree
+capacity 与 semantic-type capacity 的固定预算最大权重有向子图构建。其统计式
+版本不读取类别名称，也不使用人工类别组。
+
+**Contribution 4 — Complete OBB evaluation.**
+
+在相同实现中完成 PredCls、SGCls 和 SGDet，并同时给出 STAR-compatible 与
+strict predicted-label 协议。该项作为完整性贡献，不替代前三项算法贡献。
+
+### 1.5 贡献与实验依据
+
+| 对比 | 变化 | 证明对象 |
+|---|---|---|
+| Dual − Base | unified → shared-subject/shared-object dual view；其余 current RCA/head 不变 | 角色分解 |
+| DL − D | `lambda_LA: 0 → 0.1` | auxiliary LA |
+| Full − DL | 同一 DL checkpoint，仅 PPG → statistical RSGP | RSGP |
+| PPN vs PPG/RSGP | 相同 relation checkpoint 与 top-10,000 预算 | pair coverage 不是充分目标 |
+
+这里的 Base 即原输出目录中的 `unified` 行。完整 source RPCM、STAR 论文结果和
+`6850_4135.pth` replay 均作为外部/审计参考，不插入上述因果链。
+
+---
+
+## 2. 方法
+
+### 2.1 总体流程
+
+关系模型训练：
+
+```text
+OBB entities
+→ Semantic Filter
+→ PPG top-10000
+→ pair/union representation
+→ role-aware dual-view RCA
+→ semantic prototype classifier
+→ CE + auxiliary LA + prototype regularization
+```
+
+完整方法推理：
+
+```text
+OBB entities/detections
+→ Semantic Filter
+→ statistical RSGP top-10000
+→ the trained dual-view RCA
+→ the unchanged prototype classifier
+→ graph-constrained triplet ranking
+```
+
+RSGP 是 inference-only filter，不参与 relation-head 反向传播。Full 行必须
+复用字节相同的 DL checkpoint，不能单独训练“RSGP 模型”。
+
+### 2.2 问题定义
+
+给定实体集合
 
 \[
 \mathcal V=\{v_i=(b_i,l_i,f_i)\}_{i=1}^{N},
 \]
 
-其中，\(b_i=(x_i,y_i,w_i,h_i,\theta_i)\) 是 OBB，\(l_i\) 是实体类别，\(f_i\) 是 RoI visual feature。场景图生成的目标是在有向实体对 \((v_i,v_j),i\neq j\) 上预测 predicate \(r_{ij}\in\{0,\ldots,C_r-1\}\)，其中 0 表示 background，STAR 中 \(C_r=59\)。
-
-全部有向 pair 的数量为 \(N(N-1)\)。定义初始候选集：
-
-\[
-\mathcal E_0=\{(i,j)\mid i\neq j,\ M^{sem}_{l_i,l_j}=1\},
-\]
-
-其中，\(M^{sem}\) 是由 `SF_list_support.json` 给出的 label-pair semantic support。由于大幅 STAR 图像可能包含数千个实体，直接在 \(\mathcal E_0\) 上进行关系推理会带来不可接受的计算开销。RSGP 的目标是在固定预算 \(K=10,000\) 下构建候选关系图：
-
-\[
-\mathcal E^*=\operatorname{RSGP}(\mathcal V,\mathcal E_0),
-\qquad |\mathcal E^*|\le K.
-\]
-
-当 \(|\mathcal E_0|\le K\) 时不触发 proposal pruning，直接令 \(\mathcal E^*=\mathcal E_0\)；只有候选数超过阈值时才执行以下多源排序和约束选择。
-
-PredCls 使用 GT boxes/labels；SGCls 使用 GT boxes 和预测 object logits；SGDet 使用 detector boxes/logits。为了与 SGG-ToolKit 的 STAR 协议对齐，当前 SGCls/SGDet 的 pair filtering labels 分别采用 GT 和 matched-GT labels，该差异只改变候选图构建时使用的 \(l_i\)。
-
-本文后续统一使用以下符号：
-
-| Symbol | Meaning |
-|---|---|
-| \(N\) | 当前图像中的实体数 |
-| \(E\) | 筛选后的有向候选边数 |
-| \(K\) | relation candidate budget，默认 10,000 |
-| \(C_o,C_r\) | object/predicate 类别总数，含 background |
-| \(M_s,M_o\) | subject/object incidence matrix |
-| \(H^e,H^r\) | entity/relation hidden representation |
-| \(S_{ij}\) | pair \((i,j)\) 的 proposal score |
-
-### 4.2 Remote-sensing Graph-aware Pair Proposal
-
-#### 4.2.1 Multi-source candidate pools
-
-RSGP 使用三个互补的候选来源。
-
-**PPG precision pool.** 对 pair \((i,j)\) 构造：
-
-\[
-x_{ij}=[\operatorname{onehot}(l_i),
-        \operatorname{onehot}(l_j),q^{spatial}_{ij}],
-\]
-
-其中 \(q^{spatial}_{ij}\in\mathbb R^7\) 包括 rotated IoU、对角线比例、中心距离归一化、面积比例和 union-area 比例。两个级联 autoencoders 给出 reconstruction anomaly：
-
-\[
-\ell^{PPG}_{ij}=\frac{1}{2}\left(
-\|AE_1(x_{ij})-x_{ij}\|_2^2+
-\|AE_2(AE_1(x_{ij}))-AE_1(x_{ij})\|_2^2
-\right).
-\]
-
-PPG 保留 anomaly 最低的 pair。RSGP 使用其排序分数
-
-\[
-S^{PPG}_{ij}=1-\frac{\operatorname{rank}_{PPG}(i,j)}{|\mathcal E_{PPG}|-1}.
-\]
-
-当前默认将 PPG top-8,000 作为优先选择池，并把 PPG top-10,000 加入总候选池。
-
-**PPN recall-completion pool.** 独立 PPN 不读取 detector/RoI feature，仅使用 label 和 OBB：
-
-\[
-u_i=[g(l_i),e(l_i),\phi_b(b_i),\phi_a(v_i)],
-\]
-
-其中 \(g\) 是冻结 200-D GloVe embedding，\(e\) 是可学习 label residual embedding，\(\phi_b\) 编码归一化中心、宽高、面积、长宽比和 \((\sin\theta,\cos\theta)\)，\(\phi_a\) 编码邻近基础设施锚点。pair feature 和 pairness logit 为：
-
-\[
-p_{ij}=[u_i,u_j,q^{pair}_{ij}],\qquad
-S^{PPN}_{ij}=\operatorname{MLP}_{pair}(p_{ij}),
-\]
-
-其中 \(q^{pair}_{ij}\in\mathbb R^{14}\) 包括相对中心偏移、对两端宽高归一化的偏移、距离、尺度比、面积比和 overlap proxy。默认保留 PPN top-12,000 作为 recall-completion pool。
-
-**Remote-sensing prior pool.** RSGP 再从遥感几何、锚点和拓扑先验分数中选取 top-12,000。三个来源的并集为：
-
-\[
-\mathcal E_{pool}=\operatorname{Unique}\left(
-\mathcal E_{PPG}\cup\mathcal E_{PPN}\cup\mathcal E_{RS}
-\right).
-\]
-
-#### 4.2.2 OBB geometry prior
-
-将中心和宽高按图像尺寸归一化。对 pair \((i,j)\)，定义：
-
-\[
-\Delta c_{ij}=c_j-c_i,\quad
-d_{ij}=\|\Delta c_{ij}\|_2,\quad
-\bar d_{ij}=\frac{d_{ij}}{(\delta_i+\delta_j)/2},
-\]
-
-其中 \(\delta_i=\sqrt{w_i^2+h_i^2}\)。方向差和方向一致性为：
-
-\[
-\Delta\theta_{ij}=\left|\operatorname{atan2}
-(\sin(\theta_i-\theta_j),\cos(\theta_i-\theta_j))\right|,
-\quad p_{ij}^{\theta}=|\cos\Delta\theta_{ij}|.
-\]
-
-实现中使用由归一化中心和宽高形成的 axis-aligned envelope 计算快速 overlap proxy \(IoU^{env}_{ij}\)，并定义：
-
-\[
-c_{ij}^{close}=\exp(-\operatorname{clip}(\bar d_{ij},0,20)),
-\]
-
-\[
-c_{ij}^{compact}=\min\left(
-\frac{w_ih_i+w_jh_j}{A_{bbox-union}(i,j)},2
-\right).
-\]
-
-最终几何分数为：
-
-\[
-S^{geom}_{ij}=0.35IoU^{env}_{ij}
-+0.30c_{ij}^{close}
-+0.20c_{ij}^{compact}
-+0.15p_{ij}^{\theta}.
-\]
-
-这里需要在论文中写成 axis-aligned envelope geometry proxy，而不能写成 exact rotated IoU。
-
-#### 4.2.3 Anchor prior
-
-锚点类别包括 apron、dock、runway、taxiway、breakwater、car/truck parking 和 goods yard。对每个实体 \(v_i\)，找到最近的 anchor instance \(a_i\)，并计算：
-
-\[
-\gamma_i=\max\left(
-\exp\left[-\operatorname{clip}
-\left(\frac{\|c_i-c_{a_i}\|_2}{\delta_{a_i}},0,20\right)\right],
-\mathbb 1[v_i\text{ lies inside }a_i]
-\right).
-\]
-
-pair anchor score 为：
-
-\[
-S^{anchor}_{ij}=\max\left\{
-\mathbb 1[a_i=a_j]\gamma_i\gamma_j,
-0.6\mathbb 1[a_i\neq a_j]\gamma_i\gamma_j,
-0.4\mathbb 1[v_i\text{ or }v_j\text{ is an anchor}]
-\right\}.
-\]
-
-该分数同时允许 shared-anchor 和 different-anchor candidate，不在 proposal 阶段强制决定最终 predicate。
-
-#### 4.2.4 Motion and network topology prior
-
-对 vehicle pair，以 subject 主轴方向：
-
-\[
-d_i=(\cos\theta_i,\sin\theta_i)
-\]
-
-将相对位移分解为 along-axis 和 lateral 分量：
-
-\[
-a_{ij}=|\Delta c_{ij}^{\top}d_i|,
-\qquad
-q_{ij}=|\Delta x_{ij}\sin\theta_i-\Delta y_{ij}\cos\theta_i|.
-\]
-
-车辆拓扑分数为：
-
-\[
-S^{veh}_{ij}=0.55|\cos\Delta\theta_{ij}|
-+0.30\exp\left(-\frac{q_{ij}}{(w_i+h_i)/2}\right)
-+0.15\exp\left(-0.25\frac{a_{ij}}{\delta_i}\right).
-\]
-
-对 lattice tower、substation、genset、transmission line 等 network entity pair：
-
-\[
-S^{net}_{ij}=\exp(-0.5\bar d_{ij}).
-\]
-
-最终：
-
-\[
-S^{topo}_{ij}=\max(S^{veh}_{ij},S^{net}_{ij}),
-\]
-
-不属于对应实体类型的 pair 其分数为 0。
-
-#### 4.2.5 Hard-predicate support and degree-balance prior
-
-设 \(\mathcal H\) 为预定义 hard predicates，训练数据统计的 label-predicate support 为 \(F(l_i,l_j,r)\)，则：
-
-\[
-S^{hard}_{ij}=\mathbb 1\left[
-\sum_{r\in\mathcal H}F(l_i,l_j,r)>0
-\right].
-\]
-
-对于候选池中的初始入度和出度，degree-balance score 定义为：
-
-\[
-S^{degree}_{ij}=-\log\left(1+d_{out}(i)+d_{in}(j)\right).
-\]
-
-它降低高拥塞端点 pair 的优先级，避免少量高 degree entity 主导后续 relation context。
-
-#### 4.2.6 Hybrid scoring and constrained graph selection
-
-对连续分数进行 pool-wise z-score 标准化：
-
-\[
-\hat S=\frac{S-\mu(S)}{\sigma(S)+\epsilon}.
-\]
-
-RSGP 的组合分数为：
-
-\[
-S^{hyb}_{ij}=w_p\hat S^{PPG}_{ij}
-+w_n\hat S^{PPN}_{ij}
-+w_g\hat S^{geom}_{ij}
-+w_a\hat S^{anchor}_{ij}
-+w_t\hat S^{topo}_{ij}
-+w_l S^{hard}_{ij}
-+w_d\hat S^{degree}_{ij},
-\]
-
-默认权重为：
-
-\[
-(w_p,w_n,w_g,w_a,w_t,w_l,w_d)
-=(1.0,0.35,0.35,0.25,0.20,0.15,0.15).
-\]
-
-RS pool 内部用于预筛选的分数为：
-
-\[
-S^{RS}_{ij}=S^{geom}_{ij}+0.7S^{anchor}_{ij}
-+0.6S^{topo}_{ij}+0.35S^{hard}_{ij}.
-\]
-
-按照 \(S^{hyb}\) 降序 greedy 选边。对已选集合 \(\mathcal E\)，严格阶段要求：
-
-\[
-d^{\mathcal E}_{out}(i)<D_{out},\qquad
-d^{\mathcal E}_{in}(j)<D_{in},\qquad
-n^{\mathcal E}_{l_i,l_j}<Q,
-\]
-
-默认 \(D_{out}=D_{in}=96,Q=800\)。算法依次处理 PPG top-8,000 优先池和其余排序候选；不足 \(K\) 时放宽到 \(D=128,Q=1200\)，最后进行无约束补齐，直至达到 top-10,000 或候选耗尽。
-
-完整 inference-time selection 可写为：
+其中 \(b_i=(x_i,y_i,w_i,h_i,\theta_i)\) 为 OBB，\(l_i\) 为实体类别，
+\(f_i\) 为 RoI feature。STAR 的内部 ID 约定为：
 
 ```text
-Algorithm 1: RSGP Hybrid Pair Selection
-Input : entities V, semantic-valid pairs E0, budget K
-Output: selected directed relation graph E
-
-1  if |E0| <= K: return E0
-2  Eppg <- TopK(PPG(E0), 10000);  P <- first 8000 edges of Eppg
-3  Eppn <- TopK(PPN(E0), 12000)
-4  Ers  <- TopK(S_RS(E0), 12000)
-5  Epool <- Unique(Eppg union Eppn union Ers)
-6  compute normalized hybrid score S_hyb for Epool
-7  E <- GreedySelect(P, degree=96, label_pair_quota=800)
-8  E <- GreedySelect(Epool sorted by S_hyb, degree=96, quota=800, seed=E)
-9  if |E| < K: repeat with degree=128 and quota=1200
-10 if |E| < K: append remaining pairs by S_hyb without structural caps
-11 return first min(K, |Epool|) pairs in E
+object:    0 = background, 1...48 = foreground
+predicate: 0 = background, 1...58 = foreground
 ```
 
-默认实现超参数汇总如下：
-
-| Item | Default |
-|---|---:|
-| Final pair budget \(K\) | 10,000 |
-| PPG protected pool | 8,000 |
-| PPG union pool | 10,000 |
-| PPN completion pool | 12,000 |
-| RS-prior pool | 12,000 |
-| Strict in/out degree cap | 96 / 96 |
-| Relaxed in/out degree cap | 128 / 128 |
-| Strict/relaxed label-pair quota | 800 / 1,200 |
-| Pair scoring block size | 200,000 |
-
-RSGP 目前仅用于 inference-time filtering，不参与 relation-head 反向传播，因此 D/E 消融能够在同一 checkpoint 上隔离 candidate graph 的影响。
-
-### 4.3 Pair and union representation
-
-对每个候选 pair \((i,j)\)，原 RPCM pair extractor 融合 subject/object RoI feature、word embedding、相对 OBB position encoding 和 union visual feature，得到实体表示 \(h_i^e\) 及初始关系表示 \(h_{ij}^{r,0}\)：
+Semantic Filter 产生有向候选全集
 
 \[
-h_{ij}^{r,0}=\Phi_{pair}
-(f_i,f_j,g(l_i),g(l_j),\phi_{pos}(b_i,b_j),f_{ij}^{union}).
+\mathcal E_0=
+\{(i,j)\mid i\ne j,\ M^{sem}_{l_i,l_j}=1\}.
 \]
 
-该模块沿用 RPCM，不作为本文新贡献；本文主要改变其后的 relation graph construction 和 message passing。
-
-### 4.4 Role-aware dual-view relation GNN
-
-设候选图含 \(N\) 个实体和 \(E\) 条关系边。定义 subject/object incidence matrices：
-
-\[
-M_s\in\{0,1\}^{N\times E},\quad
-(M_s)_{v,e}=\mathbb 1[v=s_e],
-\]
-
-\[
-M_o\in\{0,1\}^{N\times E},\quad
-(M_o)_{v,e}=\mathbb 1[v=o_e].
-\]
-
-SGG-ToolKit 使用统一关系邻接：
-
-\[
-A_u=\mathbb 1\left[(M_s+M_o)^\top(M_s+M_o)>0\right]-I,
-\]
-
-它将 shared-subject、shared-object 以及 subject-object cross-role sharing 合并。其实体邻接是每张图内部除自身外的完全图：
-
-\[
-A_e^{base}=\operatorname{blockdiag}
-\left(\mathbf 1_{N_i\times N_i}-I_{N_i}\right).
-\]
-
-原版六路 collection 的统一形式为：
-
-\[
-\operatorname{Collect}_q(T,S,A)
-=\frac{A\operatorname{ReLU}(SW_q+b_q)}{A\mathbf 1+\epsilon},
-\]
-
-其中 (q\in\{0,\ldots,5\}) 分别对应 relation→subject entity、relation→object entity、subject entity→relation、object entity→relation、entity→entity 和 relation→relation。原版 update 不含额外投影或激活：
-
-\[
-\operatorname{Update}(T,C)=T+C.
-\]
-
-因此 SGG-ToolKit baseline 的每轮更新为：
-
-\[
-H^{e,l+1}=H^{e,l}+\frac{1}{3}\left[
-\operatorname{Collect}_4(H^{e,l},H^{e,l},A_e^{base})
-+\operatorname{Collect}_0(H^{e,l},H^{r,l},M_s)
-+\operatorname{Collect}_1(H^{e,l},H^{r,l},M_o)
-\right],
-\]
-
-\[
-H_{base}^{r,l+1}=H^{r,l}+\frac{1}{3}\left[
-\operatorname{Collect}_2(H^{r,l},H^{e,l},M_s^\top)
-+\operatorname{Collect}_3(H^{r,l},H^{e,l},M_o^\top)
-+\operatorname{Collect}_5(H^{r,l},H^{r,l},A_u)
-\right].
-\]
-
-六个 collection unit 和 update unit 在所有传播轮次间共享，分类器使用最后一轮 (H_{base}^{r,L})。本文的 dual-view GNN 则分别构造：
-
-\[
-A_s=\mathbb 1[M_s^\top M_s>0]-I,
-\qquad
-A_o=\mathbb 1[M_o^\top M_o>0]-I.
-\]
-
-实体图由当前 relation endpoints 构造：
-
-\[
-A_e=\mathbb 1[M_oM_s^\top+(M_oM_s^\top)^\top>0]-I.
-\]
-
-对任意邻接 \(A\)，dense residual GCN 为：
-
-\[
-\tilde A=A+I,\qquad
-\hat A=D^{-1/2}\tilde A D^{-1/2},
-\]
-
-\[
-X=\operatorname{Drop}(H),
-\qquad
-\operatorname{GCN}(H,A)=\sigma
-\left(\hat AXW+b+X\right).
-\]
-
-实体到关系的 role-specific collection 使用 incidence attention：
-
-\[
-\operatorname{Collect}_{u}(H^e,M_u)
-=\frac{M_u^\top\operatorname{ReLU}(H^eW_u+b_u)}
-{M_u^\top\mathbf 1+\epsilon},\qquad u\in\{s,o\}.
-\]
-
-第 \(l\) 层更新为：
-
-\[
-H^{e,l+1}=\operatorname{GCN}_e(H^{e,l},A_e),
-\]
-
-\[
-H^{r,l+1}=\frac{1}{4}\left[
-\operatorname{Collect}_{s}(H^{e,l},M_s)
-+\operatorname{Collect}_{o}(H^{e,l},M_o)
-+\operatorname{GCN}_r(H^{r,l},A_s)
-+\operatorname{GCN}_r(H^{r,l},A_o)
-\right].
-\]
-
-shared-subject 和 shared-object 视角共享同一组 \(\operatorname{GCN}_r\)
-参数。与 SGG-ToolKit baseline 相比，本模块同时改变 relation graph 的
-角色分解和 GNN 更新方式。现有 6850 结果验证了该模块作为完整基础模型的
-可用性，但由于没有完成只替换 GNN block 的同初始化重训练，本文不把它与
-paper baseline 的数值差直接解释为该模块的独立因果增益。经过 \(L\) 轮传播后，聚合所有层：
-
-\[
-\bar H^r=\frac{1}{L+1}\sum_{l=0}^{L}H^{r,l},
-\]
-
-并对 entity states 使用相同的 all-layer aggregation：
-
-\[
-\bar H^e=\frac{1}{L+1}\sum_{l=0}^{L}H^{e,l}.
-\]
-
-PredCls 的 object output 由 GT labels 直接给出，因此 \(\bar H^e\) 不改变
-PredCls 指标；SGCls/SGDet 的 object refinement 使用该聚合表示。
-
-先将 relation context 下采样到分类器维度：
-
-\[
-\bar H^r_{down}=\operatorname{DownSamp}(\bar H^r),
-\]
-
-\[
-H^{rel}=\operatorname{LayerNorm}
-\left(\bar H^r_{down}+\operatorname{MLP}_{res}(\bar H^r_{down})\right).
-\]
-
-PredCls 使用 \(L=4\)，SGCls/SGDet 使用 \(L=3\)。
-
-### 4.5 Semantic prototype classifier
-
-设 predicate 类别文本 embedding 为 \(t_c\)，映射并归一化得到 prototype：
-
-\[
-p_c=\operatorname{Norm}(W_pt_c).
-\]
-
-本文使用的 `6850_4135.pth` 版本为每类一个 300-D GloVe
-prototype（\(K=1\)），没有 multi-prototype 聚类，也没有 batch-wise visual
-prototype 更新。初始化时保存一个静态映射锚点
-
-\[
-p_c^{0}=\operatorname{Norm}(W_p^{0}t_c),
-\]
-
-训练期间 \(W_p\) 和 \(t_c\) 对应的 `base_prototypes` 可学习，但
-\(p_c^0\) 不更新。当前 prototype 为：
-
-\[
-\bar p_c=\operatorname{Norm}
-\left(\rho p_c+(1-\rho)p_c^{0}\right),
-\qquad \rho=0.9.
-\]
-
-因此，代码中沿用的 `proto_ema` 名称只表示**初始化锚点**，并不是训练中
-持续更新的 visual EMA。该细节与 6850 checkpoint 的参数和训练行为保持一致。
-历史 HPRC 运行发生在恢复该细节之前，其保存的 `proto_ema`
-已经几乎对齐到当时的 mapped prototype；加载 checkpoint 后该 buffer 是固定
-模型状态，所以现有 PredCls 推理数字仍然有效。论文中应把“静态初始化锚点”
-明确归属于 6850 base，而不要声称后续 HPRC checkpoint 从头到尾采用了完全相同的
-buffer 更新过程。
-
-relation feature 投影为：
-
-\[
-z_{ij}=\operatorname{Norm}(\Phi_{proj}(h_{ij}^{rel})),
-\]
-
-predicate logit 为 cosine similarity：
-
-\[
-z^{proto}_{ij,c}=\tau z_{ij}^{\top}\bar p_c,
-\]
-
-其中 \(\tau\) 为可学习 temperature scale。prototype pull loss 为：
-
-\[
-\mathcal L_{pull}=\lambda_{pull}
-\frac{1}{|\mathcal E_{train}|}
-\sum_{(i,j)}\left(1-z_{ij}^{\top}\bar p_{y_{ij}}\right).
-\]
-
-使用 ETF separation，\(C=C_r\)，prototype Gram matrix \(G_{cd}=\bar p_c^\top\bar p_d\)，则：
-
-\[
-\mathcal L_{sep}=\lambda_{sep}
-\frac{1}{C(C-1)}
-\sum_{c\ne d}\left(G_{cd}+\frac{1}{C-1}\right)^2.
-\]
-
-6850 还保留一组固定语义配对 \(\mathcal A\) 的历史 margin 正则：
-
-\[
-\mathcal L_{ant}=\frac{\lambda_{ant}}{|\mathcal A|}
-\sum_{(a,b)\in\mathcal A}
-\max\left(0,m_{ant}-\bar p_a^\top\bar p_b\right),
-\]
-
-其中 \(\lambda_{ant}=0.1\)，\(m_{ant}=-0.2\)。这里忠实保留 6850
-实现中的符号；尽管变量名为 `ant`，该表达式实际约束 cosine similarity
-不要低于 \(-0.2\)，不应在论文中解释为普通的“把反义类无限推远”。
-
-当前参数为 \(\lambda_{pull}=0.2,\lambda_{sep}=0.01\)。该 prototype
-classifier 和三项 prototype regularization 源自既有 RPCM-6850 基础模型；
-本文保留它们作为稳定分类基础，而不将其列为新贡献。
-
-### 4.6 Hard-Predicate Residual Calibration
-
-由训练集 predicate counts \(n_c\) 定义类别先验：
-
-\[
-\pi_c=\frac{\max(n_c,1)}{\sum_k\max(n_k,1)}.
-\]
-
-记 \(\tilde z\) 为最终 predicate logits：未启用 HPRC 时 \(\tilde z=z^{proto}\)，启用时使用下文定义的融合 logits \(z'\)。主分类损失保持 CE：
-
-\[
-\mathcal L_{CE}=\operatorname{CE}(\tilde z,y).
-\]
-
-仅增加小权重 logit-adjust auxiliary：
-
-\[
-\mathcal L_{LA}=\operatorname{CE}
-\left(\tilde z+\tau_{LA}\log\pi,y\right),
-\]
-
-\[
-\mathcal L_{cls}=\mathcal L_{CE}
-+\lambda_{LA}\mathcal L_{LA},
-\qquad \lambda_{LA}=0.1,\quad\tau_{LA}=0.5.
-\]
-
-定义困难谓词集合 \(\mathcal H\)。该集合综合训练频率、历史验证召回和稳定混淆模式确定，因而不等同于简单的低频集合。轻量残差校准头输出 \(a_{ij}\in\mathbb R^{|\mathcal H|}\)，并融合到对应类别：
-
-\[
-\alpha=\alpha_{max}\tanh(s),\qquad
-z'_{ij,c}=z^{proto}_{ij,c}+\alpha a_{ij,c},\quad c\in\mathcal H,
-\]
-
-其中 \(s\) 初始化为 0，\(\alpha_{max}=0.3\)，因此初始模型严格退化为原 prototype logits，并令 \(\tilde z=z'\)。HPRC target 为当前单标签 predicate 在 \(\mathcal H\) 上的 binary vector（当前协议下至多一个正类），损失为：
-
-\[
-\mathcal L_{HPRC}=-\frac{1}{|\mathcal E||\mathcal H|}
-\sum_{(i,j),c\in\mathcal H}
-\left[w_cy_{ij,c}\log\sigma(a_{ij,c})
-+(1-y_{ij,c})\log(1-\sigma(a_{ij,c}))\right],
-\]
-
-\[
-w_c=\operatorname{clip}
-\left(\frac{\sum_{k>0}n_k}{n_c},1,20\right).
-\]
-
-6850 base 的预训练目标为：
-
-\[
-\mathcal L_{6850}=\mathcal L_{CE}
-+\mathcal L_{pull}
-+\mathcal L_{sep}
-+\mathcal L_{ant}.
-\]
-
-现有 `best_bgfirst.pth` 对应的历史 HPRC 训练日志只包含 `pull`、`sep`
-和新增的 LA/HPRC 项，没有再次记录 `ant`，因此用于本文结果的 calibration
-目标应写为：
-
-\[
-\mathcal L_{HPRC\text{-}stage}=\mathcal L_{CE}
-+0.1\mathcal L_{LA}
-+0.2\mathcal L_{HPRC}
-+\mathcal L_{pull}
-+\mathcal L_{sep}.
-\]
-
-换言之，`ant` 的影响已经包含在 warm-start 的 6850 权重中，但不应伪装成
-现有 HPRC 阶段额外优化过的 loss。
-
-SGCls/SGDet 额外加入 object refinement CE：
-
-\[
-\mathcal L=\mathcal L_{pred}
-+\mathbb 1[task\ne PredCls]\mathcal L_{obj}.
-\]
-
-冻结 detector 的 RPN/box losses 不参与当前 relation-stack 优化。
-
-### 4.7 Task-specific object refinement
-
-对于 SGCls/SGDet，object refinement feature 为：
-
-\[
-q_i^{obj}=W_o[f_i,g(l_i\text{ or }P_i),\phi_{pos}(b_i)],
-\qquad
-z_i^{obj}=W_{cls}q_i^{obj},
-\]
-
-其中，SGCls/SGDet 使用 detector distribution \(P_i\) 与 object embedding matrix 的加权和；PredCls 直接返回 GT label one-hot logits，不计算 object classification loss。
-
-图约束推理时，每个候选 pair 只保留分数最高的前景 predicate：
-
-\[
-\hat r_{ij}=\arg\max_{c\in\{1,\ldots,C_r-1\}}p(r=c\mid i,j).
-\]
-
-用于全图 top-\(K\) 排序的 triplet score 为：
-
-\[
-S^{triplet}_{ij}
-=p(r=\hat r_{ij}\mid i,j)\,
-p(l_i\mid b_i)\,p(l_j\mid b_j).
-\]
-
-PredCls 中 object scores 为 1；SGCls/SGDet 中保留 object confidence 的乘积。因此，RSGP 改变的是进入关系头的候选图，而最终排序仍遵循与 STAR evaluator 一致的 graph-constrained triplet scoring。
-
-### 4.8 RSGP 默认流程摘要
-
-```text
-semantic filter
-→ PPG protected top-8000
-→ PPN top-12000 recall pool
-→ RS-prior top-12000 pool
-→ hybrid ranking
-→ max in/out degree 96
-→ label-pair quota 800
-→ relaxed second pass
-→ final top-10000
-→ RPCM relation reasoning
-```
-
----
-
-## 5. 实验设置
-
-### 5.1 Dataset
-
-| Item | Setting |
-|---|---:|
-| Dataset | STAR |
-| Box representation | OBB |
-| Foreground object classes | 48 |
-| Foreground predicate classes | 58 |
-| Train images | 771 |
-| Validation images | 245 |
-| Test images | 264 |
-| Split | Fixed split |
-| Train duplicate relations | Filtered for current single-label GC protocol |
-| Pair budget | top-10,000 |
-
-### 5.2 Tasks
-
-| Task | Boxes | Object labels | Predicate |
-|---|---|---|---|
-| PredCls | GT | GT | Predicted |
-| SGCls | GT | Predicted | Predicted |
-| SGDet | Predicted | Predicted | Predicted |
-
-为对齐 SGG-ToolKit/STAR，当前 SGCls pair filter 使用 GT object labels；SGDet pair filter/训练匹配使用 `matched_gt` labels，但最终 object/predicate 输出仍由模型产生。论文中必须明确写出这一 legacy protocol，并建议附加 `pred` label-source 的严格协议作为补充实验。
-
-### 5.3 Metrics
-
-主指标为：
-
-- Recall: `R@K`；STAR 原论文中记作 `MR@K`；
-- Mean Recall: `mR@K`；STAR 原论文中记作 `mMR@K`；
-- Harmonic Mean Recall:
-
-设测试集中有效图像数为 \(T\)，第 \(n\) 张图的 GT 有向 pair 集为 \(G_n\)，top-\(K\) 预测匹配到的 GT relation index 集为 \(M_n^K\)。当前 evaluator 先计算每图 recall，再对图像取平均：
-
-\[
-R@K=\frac{1}{T}\sum_{n=1}^{T}
-\frac{|M_n^K|}{\max(|G_n|,1)}.
-\]
-
-对前景 predicate \(c\in\{1,\ldots,C_r-1\}\)，令 \(T_c\) 为含该类 GT 的图像集合，\(G_{n,c}\) 和 \(M_{n,c}^K\) 分别为该图像中类别 \(c\) 的 GT 与命中集合，则：
-
-\[
-R_c@K=\frac{1}{|T_c|}\sum_{n\in T_c}
-\frac{|M_{n,c}^K|}{|G_{n,c}|},
-\]
-
-\[
-mR@K=\frac{1}{C_r-1}\sum_{c=1}^{C_r-1}R_c@K.
-\]
-
-没有在测试集中出现的 predicate 在当前实现中贡献 0；因此主表必须保持相同的 58 类词表和 fixed test split。综合指标定义为：
-
-\[
-HMR@K=\frac{2\cdot R@K\cdot mR@K}{R@K+mR@K}.
-\]
-
-主表报告 `K=1500,2000`，补充材料可报告 `K=1000`。所有方法必须使用同一 evaluator、同一 graph-constrained protocol 和同一 filter label source。
-
-### 5.4 Detector and relation model
-
-| Component | Setting |
-|---|---|
-| OBB detector | Swin-L OBB detector from `pretrained/OBB_swin_L_OBD.pth` |
-| Detector status | Frozen |
-| Relation predictor | `RPCM_ORIGINAL_LEGACY` |
-| Pair feature dimension | 4096 |
-| RPCM MLP dimension | 2048 |
-| PredCls propagation steps | 4 |
-| SGCls/SGDet propagation steps | 3 |
-| Relation graph | 6850 dual view: shared-subject and shared-object graphs |
-| Graph output | Mean of the input state and all propagation states |
-| Predicate classifier | One GloVe prototype per class + static initialization anchor |
-| Prototype losses | pull 0.2, ETF separation 0.01, historical pair-margin 0.1 |
-| Default filter | RSGP Hybrid 8000/2000 for proposed method |
-
-### 5.5 Optimization
-
-| Task | Batch | Optimizer | Configured base LR | Effective stop | LR milestones |
-|---|---:|---|---:|---:|---|
-| RPCM-6850 base | 16 | SGD | 0.016 effective | 20,000 iters; selected at 17,600 | 13,000, 18,000 iters |
-| Historical PredCls HPRC checkpoint (reported results) | 16 | SGD | 0.016 | 200 epochs | 6000, 8500, 10000 iters |
-| Clean PredCls HPRC scratch config (future controlled run) | 16 | SGD | 0.016 | 300 epochs | 10,000, 14,000, 16,000 iters |
-| SGCls | 16 | SGD | 0.001 with batch scaling | 15000 iters | 8000, 13000 |
-| SGDet | 8 | SGD | 0.001 with batch scaling | 12000 iters | 8000, 10000 |
-
-Common settings: momentum 0.9, weight decay `1e-4`, gradient clipping 5.0. The
-RPCM-6850 run used 500 warmup iterations. The historical PredCls HPRC
-checkpoint reported in the existing tables starts from `6850_4135.pth`; its
-residual-calibration loss weight is 0.2 and its logit-adjust auxiliary weight
-is 0.1 with `tau=0.5`. For future controlled training,
-`bash scripts/run_star_tail_aux.sh` now initializes only
-`pretrained/OBB_swin_L_OBD.pth`; the corrected exact-6850 relation stack and
-HPRC parameters start from their configured initializers and use the longer
-scratch schedule shown above. This change does not alter the provenance of the
-already reported checkpoint. The implementation keeps the historical
-`tail_aux` configuration/checkpoint names for compatibility; HPRC is the
-paper-facing name of the combined calibration stage.
-
-### 5.6 Reproducibility fields to complete before submission
-
-| Field | Value |
-|---|---|
-| GPU model | **TBD** |
-| CUDA version | **TBD** |
-| PyTorch version | **TBD** |
-| Number of runs/seeds | Current results are single runs; **TBD** |
-| Random seed | Current training entry does not explicitly set one; **TBD/fix required** |
-| Checkpoint selection split | Existing runs used test-time periodic evaluation; see protocol warning below |
-| Inference batch size | PredCls 2; SGCls 1; SGDet 1 unless overridden |
-
----
-
-## 6. Main results
-
-### 6.1 PredCls main comparison
-
-The STAR baseline row is copied from Table IV of the STAR paper. Project rows use the current standardized evaluator and `best_bgfirst.pth`.
-
-| Method | Pair filter | R@1500 | R@2000 | mR@1500 | mR@2000 | HMR@1500 | HMR@2000 | Status |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| STAR RPCM (SGG-ToolKit) | PPG | 64.23 | 65.86 | 41.24 | 42.30 | 50.23 | 51.51 | Paper reported |
-| Role-aware RCA base (`6850_4135.pth`) | PPG | 68.12 | 69.68 | 41.02 | 42.18 | 51.21 | 52.55 | Existing standardized test |
-| Ours: Role-aware RCA + HPRC | PPG | 67.61 | 69.17 | 42.91 | 44.14 | 52.50 | 53.89 | Existing standardized test |
-| Ours: Role-aware RCA + HPRC | PPN | 67.34 | 68.84 | 42.33 | 43.50 | 51.98 | 53.31 | Existing standardized test |
-| **Ours: Role-aware RCA + HPRC + RSGP** | **RSGP Hybrid 8000/2000** | **69.71** | **71.02** | **44.81** | **45.93** | **54.55** | **55.78** | Existing standardized test |
-
-Compared with the paper-reported STAR RPCM baseline, the current full PredCls result improves:
-
-| Metric | @1500 | @2000 |
-|---|---:|---:|
-| R | +5.48 | +5.16 |
-| mR | +3.57 | +3.63 |
-| HMR | +4.32 | +4.27 |
-
-Suggested result paragraph:
-
-> On PredCls, the proposed full model reaches 71.02% R@2000, 45.93% mR@2000 and 55.78% HMR@2000, outperforming the STAR RPCM baseline by 5.16, 3.63 and 4.27 percentage points, respectively. The simultaneous improvements in R and mR indicate that the method benefits both frequent and systematically under-recognized predicates rather than trading one metric for the other.
-
-### 6.2 SGCls main comparison
-
-Current project values correspond to the training-time test evaluation that produced `outputs/star_sgcls_obb_train/model_best_HR.pth` at epoch 237. A final one-shot evaluation should be run before submission.
-
-| Method | Pair filter | R@1500 | R@2000 | mR@1500 | mR@2000 | HMR@1500 | HMR@2000 | Status |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| STAR RPCM (SGG-ToolKit) | PPG | 51.29 | 52.72 | 30.04 | 30.85 | 37.89 | 38.92 | Paper reported |
-| Ours | PPG | **TBD** | **TBD** | **TBD** | **TBD** | **TBD** | **TBD** | Run cross-task eval |
-| **Ours** | **RSGP Hybrid 8000/2000** | **56.06** | **57.12** | **32.22** | **32.99** | **40.92** | **41.82** | Existing; one-shot replay pending |
-
-The current best-HMR SGCls checkpoint is higher than the paper-reported STAR RPCM by 4.77/4.40 points in R, 2.18/2.14 points in mR, and 3.03/2.90 points in HMR at K=1500/2000. These differences remain preliminary until the standalone one-shot evaluation is completed.
-
-### 6.3 SGDet main comparison
-
-Current project values correspond to the training-time test evaluation that produced `outputs/star_sgdet_obb_train/model_best_HR.pth` at epoch 93. A final standalone one-shot evaluation should be run before submission.
-
-| Method | Pair filter | R@1500 | R@2000 | mR@1500 | mR@2000 | HMR@1500 | HMR@2000 | Status |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| STAR RPCM (SGG-ToolKit) | PPG | 27.23 | 28.50 | 11.53 | 12.07 | 16.20 | 16.96 | Paper reported |
-| Ours | PPG | **TBD** | **TBD** | **TBD** | **TBD** | **TBD** | **TBD** | Run cross-task eval |
-| **Ours** | **RSGP Hybrid 8000/2000** | **35.68** | **36.42** | **19.07** | **19.77** | **24.85** | **25.63** | Existing; one-shot replay pending |
-
-The current best-HMR SGDet checkpoint improves over the paper-reported STAR RPCM by 8.45/7.92 points in R, 7.54/7.70 points in mR, and 8.65/8.67 points in HMR at K=1500/2000. Because SGDet is sensitive to detector/NMS/label-source details, these values should be claimed only after a standalone one-shot evaluation confirms the same protocol.
-
-### 6.4 Supplementary @1000 PredCls results
-
-| Method | R@1000 | mR@1000 | HMR@1000 |
-|---|---:|---:|---:|
-| Role-aware RCA + HPRC + PPG | 65.22 | 40.90 | 50.28 |
-| Role-aware RCA + HPRC + PPN | 65.19 | 40.53 | 49.98 |
-| Role-aware RCA + HPRC + RSGP | **67.44** | **42.78** | **52.35** |
-
----
-
-## 7. Ablation studies
-
-### 7.1 Existing-checkpoint ablation（primary retrospective ablation）
-
-Most completed experiments follow the same RPCM-6850 lineage. The base row is
-the original `6850_4135.pth`; the HPRC model was initialized from that
-checkpoint, and PPG/RSGP evaluate exactly the same HPRC checkpoint. This
-allows the existing PredCls results to be used without retraining after the
-6850 compatibility restoration: the restoration adds no state-dict tensors,
-and PredCls relation logits loaded from these checkpoints are unchanged.
-
-| ID | Model/checkpoint lineage | Dual-view RCA | HPRC | Filter | R@1500 | R@2000 | mR@1500 | mR@2000 | HMR@1500 | HMR@2000 |
-|---|---|:---:|:---:|---|---:|---:|---:|---:|---:|---:|
-| A | STAR RPCM, paper reported |  |  | PPG | 64.23 | 65.86 | 41.24 | 42.30 | 50.23 | 51.51 |
-| B | RPCM `6850_4135.pth` | ✓ |  | PPG | 68.12 | 69.68 | 41.02 | 42.18 | 51.21 | 52.55 |
-| C | `best_bgfirst.pth`, warm-started from B | ✓ | ✓ | PPG | 67.61 | 69.17 | 42.91 | 44.14 | 52.50 | 53.89 |
-| D | same checkpoint as C | ✓ | ✓ | RSGP Hybrid 8000/2000 | **69.71** | **71.02** | **44.81** | **45.93** | **54.55** | **55.78** |
-
-The valid interpretations are deliberately limited:
-
-- `C − B` measures the **combined warm-started HPRC stage**. It
-  increases mR by 1.89/1.96 points and HMR by 1.29/1.34 points at
-  K=1500/2000, while R decreases by 0.51/0.51 points.
-- `D − C` is a strict causal filter comparison because only the inference-time
-  pair graph changes. R/mR/HMR all improve.
-- `B − A` is useful as a comparison with the paper-reported baseline, but it
-  is not an isolated GNN ablation: implementation history, training run and
-  evaluator are not fully controlled. The paper may describe the role-aware
-  module and report B, but must not claim that this row alone proves its
-  independent gain.
-- Separate LA-only and residual-head-only improvements are not claimed from this table.
-  The unfinished scratch A/B/C runs remain optional supplementary experiments,
-  not required inputs to the main retrospective table.
-
-### 7.2 Pair proposal comparison and graph-quality evidence
-
-This table uses the standardized `best_bgfirst.pth` results.
-
-| Filter | Final GT pair coverage | R@2000 | mR@2000 | HMR@2000 |
-|---|---:|---:|---:|---:|
-| PPG | 79.89 | 69.17 | 44.14 | 53.89 |
-| PPN | **91.24** | 68.84 | 43.50 | 53.31 |
-| RSGP Hybrid | 75.98 | **71.02** | **45.93** | **55.78** |
-
-RSGP 的 PPN source pool coverage 为 95.83%，strict degree-cap stage coverage 为 61.76%，最终 coverage 为 75.98%。虽然最终 GT pair coverage 不是最高，RSGP 的三项 scene graph 指标均最高。这一结果直接支持核心动机：
-
-> A candidate graph with higher pair recall is not necessarily more effective for downstream relational reasoning; graph structure and contextual compatibility are equally important.
-
-### 7.3 Existing RSGP mode/quota search（exploratory）
-
-The following grid used the historical `best.pth`/older evaluation run. It is useful for selecting Hybrid 8000/2000, but should not be mixed with the standardized main table without rerunning.
-
-| Method | R@1500 | R@2000 | mR@1500 | mR@2000 | HMR@1500 | HMR@2000 | Final pair coverage |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| PPG 10000 | 67.63 | 69.19 | 42.89 | 44.17 | 52.49 | 53.92 | 79.89 |
-| PPN 10000 | 67.37 | 68.88 | 42.15 | 43.43 | 51.86 | 53.27 | **91.24** |
-| RS only | 66.07 | 66.88 | 41.63 | 42.26 | 51.08 | 51.79 | 65.88 |
-| PPN graph | **70.01** | **71.33** | 44.78 | 45.82 | **54.63** | 55.80 | 81.11 |
-| Hybrid 9000/1000 | 69.78 | 71.10 | 44.69 | 45.92 | 54.49 | 55.80 | 76.01 |
-| **Hybrid 8000/2000** | 69.76 | 71.08 | **44.80** | **45.96** | 54.56 | **55.82** | 75.98 |
-| Hybrid 7000/3000 | 69.74 | 71.06 | 44.68 | 45.90 | 54.47 | 55.77 | 75.93 |
-
-### 7.4 RSGP component ablation（reserved）
-
-| Variant | PPN completion | RS priors | Degree control | Label-pair quota | Hard-predicate prior | R@2000 | mR@2000 | HMR@2000 |
-|---|:---:|:---:|:---:|:---:|:---:|---:|---:|---:|
-| Full RSGP | ✓ | ✓ | ✓ | ✓ | ✓ | 71.02 | 45.93 | 55.78 |
-| w/o PPN completion |  | ✓ | ✓ | ✓ | ✓ | **TBD** | **TBD** | **TBD** |
-| w/o RS priors | ✓ |  | ✓ | ✓ |  | **TBD** | **TBD** | **TBD** |
-| w/o degree control | ✓ | ✓ |  | ✓ | ✓ | **TBD** | **TBD** | **TBD** |
-| w/o label-pair quota | ✓ | ✓ | ✓ |  | ✓ | **TBD** | **TBD** | **TBD** |
-| w/o hard-predicate prior | ✓ | geometry/anchor/topology | ✓ | ✓ |  | **TBD** | **TBD** | **TBD** |
-
-### 7.5 Hard-predicate calibration analysis（existing 6850 → HPRC）
-
-由于不同 predicate 的 GT 数量相差较大，主文采用带 `GT count` 的数值表，而不使用对所有类别赋予相同视觉权重的柱状图或哑铃图。这样可以同时呈现类别基数、绝对召回率和百分点变化。完整 58 类结果可放入补充材料；下表保留 HPRC 所关注的 15 个困难谓词，并同时报告提升和退化项，避免选择性展示。
-
-| Predicate | GT count | RPCM-6850 R@2000 | RPCM-6850 + HPRC R@2000 | Delta (pp) |
-|---|---:|---:|---:|---:|
-| randomly docked at | 562 | 0.00 | 0.53 | +0.53 |
-| randomly parked on | 375 | 2.40 | 3.35 | +0.95 |
-| not run along | 36 | 0.00 | 5.00 | +5.00 |
-| not parked alongside with | 655 | 7.45 | 17.71 | +10.26 |
-| running along the different taxiway with | 466 | 7.15 | 19.07 | +11.92 |
-| running along the same taxiway with | 116 | 11.36 | 13.79 | +2.43 |
-| within danger distance of | 666 | 22.46 | 23.05 | +0.59 |
-| incorrectly parked on | 61 | 20.28 | 26.94 | +6.66 |
-| not docked alongside with | 528 | 0.66 | 0.93 | +0.27 |
-| driving in the different lane with | 1737 | 13.47 | 13.35 | -0.12 |
-| driving in the same lane with | 1499 | 5.20 | 4.67 | -0.53 |
-| driving alongside with | 307 | 18.74 | 11.59 | -7.15 |
-| indirectly connected to | 34 | 15.15 | 23.11 | +7.96 |
-| indirectly transmit electricity to | 27 | 9.09 | 22.73 | +13.64 |
-| not working on | 19 | 6.25 | 12.50 | +6.25 |
-
-Values are percentages and come from two PPG evaluations with the same fixed
-test split. HPRC strongly improves several systematically under-recognized
-predicates, but the effect is not uniform: the two lane predicates and
-`driving alongside with` do not improve. The result therefore supports HPRC
-as a calibration mechanism that improves aggregate class balance; it does not
-claim that every calibrated predicate necessarily increases. `Delta` is
-reported in percentage points rather than relative percentage, which avoids
-inflating changes for classes whose baseline recall is close to zero.
-
-At the aggregate level, HPRC changes the PPG result from
-`R/mR/HMR@2000 = 69.68/42.18/52.55` to `69.17/44.14/53.89`. Thus mR and HMR
-increase by 1.96 and 1.34 points, respectively, while R decreases by 0.51
-points. This trade-off motivates coupling HPRC with RSGP in the full model,
-which raises all three metrics to `71.02/45.93/55.78`.
-
----
-
-## 8. Qualitative/diagnostic experiments to include
-
-### Figure A: PPG vs PPN vs RSGP candidate graph
-
-预留图：对同一 STAR 图像可视化三种 filter 的 top-10,000 graph。
-
-- blue: correctly retained GT pairs；
-- red/purple: missed GT pairs；
-- gray: non-GT candidate pairs；
-- node size: degree；
-- annotate max/mean degree and label-pair concentration.
-
-预期展示：PPN 保留更多 GT pairs，但产生的局部结构不一定最适合 RPCM；RSGP 通过 degree/quota 重构图后获得更高 triplet recall。
-
-### Figure B: Role-aware relation context
-
-预留图：展示共享同一实体但角色不同的 relations。例如：
-
-```text
-(airplane_A, parked_on, apron)
-(airplane_B, parked_on, apron)
-(apron, adjacent_to, terminal)
-```
-
-统一图会把三条边直接混合；dual-view 图将前两条 shared-object 上下文与第三条跨角色上下文分开。
-
-### Figure C: HPRC hard-predicate examples
-
-建议选择：
-
-- driving in the same/different lane with；
-- within safe/danger distance of；
-- parked/not parked alongside with；
-- directly/indirectly connected to；
-- working/not working on。
-
----
-
-## 9. Minimal experiment execution checklist
-
-### 9.1 PredCls existing-checkpoint table
-
-No new relation-head training is required to reproduce the primary
-retrospective table. Its three project rows are obtained with:
-
-```bash
-# RPCM-6850 dual-view base + PPG
-bash scripts/eval_predcls_minimal_ablation.sh 6850
-
-# Warm-started HPRC checkpoint + PPG
-bash scripts/eval_predcls_minimal_ablation.sh D
-
-# The exact same HPRC checkpoint + RSGP
-bash scripts/eval_predcls_minimal_ablation.sh E
-```
-
-The STAR/SGG-ToolKit row is copied from the paper and is not retrained. The
-scratch launchers `run_predcls_minimal_ablation.sh A|B|C` remain available for
-future controlled supplementary analysis, but they are not prerequisites for
-the numbers currently reported in Section 7.1.
-
-For a new controlled HPRC run that does not inherit the historical 6850
-checkpoint, use:
-
-```bash
-bash scripts/run_star_tail_aux.sh
-```
-
-This launcher forces `INIT_RPCM=''`. The frozen detector is loaded from
-`pretrained/OBB_swin_L_OBD.pth` by the model config, while the corrected
-dual-view RPCM, GloVe prototypes and HPRC head are initialized from scratch.
-Its default output is `outputs/star_predcls_obb_hprc_scratch`, so it does not
-overwrite the historical `outputs/star_predcls_obb_tail_aux` results used in
-the current tables.
-
-### 9.2 RSGP component ablation
-
-```bash
-bash scripts/eval_predcls_rsgp_ablation.sh FULL
-bash scripts/eval_predcls_rsgp_ablation.sh NO_PPN
-bash scripts/eval_predcls_rsgp_ablation.sh NO_RS
-bash scripts/eval_predcls_rsgp_ablation.sh NO_DEGREE
-bash scripts/eval_predcls_rsgp_ablation.sh NO_QUOTA
-bash scripts/eval_predcls_rsgp_ablation.sh NO_TAIL
-```
-
-### 9.3 Cross-task PPG/RSGP evaluation
-
-```bash
-bash scripts/eval_cross_task_minimal.sh SGCLS_PPG
-bash scripts/eval_cross_task_minimal.sh SGCLS_RSGP
-bash scripts/eval_cross_task_minimal.sh SGDET_PPG
-bash scripts/eval_cross_task_minimal.sh SGDET_RSGP
-```
-
----
-
-## 10. Protocol warnings before publication
-
-### 10.1 Test-set checkpoint selection
-
-Current historical runs use periodic test evaluation and save `model_best_HR.pth` according to test HMR. This is acceptable for internal exploration and reproduces the current workflow, but it is not a clean validation protocol.
-
-Formal options:
-
-1. Preferred: use STAR validation split for checkpoint selection and evaluate test exactly once；
-2. Minimal retrospective: use a fixed epoch selected before inspecting test results；
-3. If retaining current results, explicitly disclose the model-selection protocol and avoid claims based on tiny metric differences.
-
-### 10.2 Initialization/training-budget fairness
-
-The completed project experiments use the following checkpoint lineage:
-
-```text
-pretrained/OBB_swin_L_OBD.pth
-  -> RPCM/weights/6850_4135.pth
-  -> outputs/star_predcls_obb_tail_aux/best_bgfirst.pth
-  -> PPG / PPN / RSGP evaluations of the same HPRC checkpoint
-```
-
-The restored 6850 compatibility path changes training behavior only when
-initializing a new model: exact GloVe copying, static `proto_ema`, the historic
-pair-margin loss and layer averaging. It adds no parameters or buffers and
-checkpoint loading overwrites all affected learned tensors. Therefore the
-existing 6850-derived **PredCls** inference results do not need to be repeated
-solely because of this restoration.
-
-This statement does not automatically cover SGCls/SGDet. The exact 6850 graph
-path averages all entity states before object refinement, whereas an earlier
-project revision used only the last entity state. PredCls returns GT one-hot
-object logits and is unaffected; SGCls/SGDet use `out_obj` and should retain
-their planned standalone one-shot evaluation under the frozen final code.
-
-Fairness must nevertheless be described precisely. The 6850 → HPRC comparison
-is warm-started calibration, not two independent from-scratch runs. It supports
-the effect of the combined HPRC stage, but cannot isolate LA from the residual
-calibration head. Only PPG → RSGP, using one identical checkpoint, is a strictly
-controlled one-variable comparison. Optional scratch A/B/C runs may be used in
-supplementary material if a reviewer requires an isolated GNN or LA ablation.
-
-### 10.3 SGCls/SGDet label-source protocol
-
-Current legacy-compatible settings are:
+当 \(|\mathcal E_0|>K\) 时必须筛选，本文与 STAR 协议固定
+\(K=10{,}000\)。
+
+PredCls 使用 GT boxes/labels；SGCls 使用 GT boxes 和预测 object outputs；
+SGDet 使用 detector boxes/outputs。为直接对齐 STAR，legacy pair filtering
+分别使用：
 
 ```text
 SGCLS_FILTER_LABEL_SOURCE=gt
 SGDET_FILTER_LABEL_SOURCE=matched_gt
 ```
 
-These settings reproduce SGG-ToolKit's STAR-specific pair-filter behavior. They should be used for direct comparison, but strict predicted-label results should be provided in supplementary material if possible.
+strict 补充协议则使用预测标签做 filtering。最终 object/predicate 输出始终由
+对应任务模型产生，filter label source 只控制候选对构建。
 
-### 10.4 Single-run uncertainty
+### 2.3 Pair and union representation
 
-Current results are single runs without an explicitly fixed global random seed. Before making claims about improvements smaller than approximately 0.3 percentage points, run at least three seeds or report that the experiment is deterministic and verify it empirically.
+沿用 RPCM 的 pair extractor。对候选 pair \((i,j)\)：
+
+\[
+h_{ij}^{r,0}=\Phi_{pair}
+\left(f_i,f_j,g(l_i),g(l_j),
+\phi_{pos}(b_i,b_j),f_{ij}^{union}\right).
+\]
+
+这里包含 subject/object RoI feature、对象 GloVe、OBB 相对位置和 union
+visual feature。该模块是公共基础，不作为本文创新。
+
+### 2.4 SGG-ToolKit source audit
+
+设 \(E=|\mathcal E|\)，subject/object incidence matrix 为
+
+\[
+(M_s)_{v,e}=\mathbb 1[v=s_e],\qquad
+(M_o)_{v,e}=\mathbb 1[v=o_e].
+\]
+
+Source audit 使用统一关系邻接：
+
+\[
+A_u=\mathbb 1[(M_s+M_o)^\top(M_s+M_o)>0]-I.
+\]
+
+因此 shared-subject、shared-object 和 cross-role endpoint sharing 都进入
+同一个 \(A_u\)。对象图在每张图内部为除 self-loop 外的完全图
+\(A_e^{base}\)。
+
+原 SGG-ToolKit 的六路 collector 为
+
+\[
+\operatorname{Collect}_{q}(T,S,A)=
+\frac{A\,\operatorname{ReLU}(SW_q+b_q)}
+{A\mathbf 1+\epsilon},
+\]
+
+其中 \(q=0,\ldots,5\) 分别表示：
+
+```text
+0 relation → subject entity
+1 relation → object entity
+2 subject entity → relation
+3 object entity → relation
+4 entity → entity
+5 relation → relation
+```
+
+每轮共享同一组六个 collector，update 为参数无关的残差：
+
+\[
+\operatorname{Update}(T,C)=T+C.
+\]
+
+因此
+
+\[
+H^{e,l+1}=H^{e,l}+\frac{1}{3}
+\left(m_{e\to e}^{l}+m_{r\to s}^{l}+m_{r\to o}^{l}\right),
+\]
+
+\[
+H_{base}^{r,l+1}=H^{r,l}+\frac{1}{3}
+\left(m_{s\to r}^{l}+m_{o\to r}^{l}+m_{u,r\to r}^{l}\right).
+\]
+
+Source audit 分类使用最后一轮 \(H_{base}^{r,L}\)。该分支由独立 predictor
+`RPCM_SGG_TOOLKIT_ORIGINAL` 实现；它不仅恢复上述 GNN，也恢复 source
+classifier，不能用仅设置
+`RPCM_RELATION_GRAPH_MODE="sgg_toolkit"` 的 later-RPCM predictor 代替。
+
+#### 2.4.1 Source gated prototype classifier
+
+原版在 GNN 后另行构造 300-D object/predicate GloVe embedding（与
+pairwise extractor 内部的 200-D object embedding 是两套参数）。令
+\(e_i\) 为 object text embedding，\(x_i^s,x_i^o\) 为对象视觉特征的
+subject/object 投影，首先得到
+
+\[
+s_i=W_se_i+
+\sigma\!\left(G_s[W_se_i;h(x_i^s)]\right)\odot h(x_i^s),
+\]
+
+\[
+o_j=W_oe_j+
+\sigma\!\left(G_o[W_oe_j;h(x_j^o)]\right)\odot h(x_j^o).
+\]
+
+经过 residual linear layer 与 LayerNorm 后，subject-object 融合为
+
+\[
+F(s_i,o_j)=\operatorname{ReLU}(s_i+o_j)-(s_i-o_j)^2.
+\]
+
+设 \(u_{ij}=h(\operatorname{DownSamp}(H_{ij}^{r,L}))\)，原版使用减法门控
+构造关系表示：
+
+\[
+\widetilde r_{ij}=F(s_i,o_j)-
+\sigma\!\left(G_p[F(s_i,o_j);u_{ij}]\right)\odot u_{ij},
+\]
+
+\[
+z_{ij}=\operatorname{Proj}\!\left(
+\operatorname{Drop}\left[
+\operatorname{ReLU}\left(
+\operatorname{LN}(\widetilde r_{ij}+
+\operatorname{Drop}(\operatorname{ReLU}(W_r\widetilde r_{ij})))
+\right)\right]\right).
+\]
+
+predicate 文本向量 \(t_c\) 通过 \(W_p\) 和同一个 projection head 得到
+\(c_c\)。最终 source logits 为
+
+\[
+\ell_{ij,c}=
+\exp(\gamma)\,
+\frac{z_{ij}^{\top}c_c}
+{\lVert z_{ij}\rVert_2\lVert c_c\rVert_2},
+\qquad \gamma=\log(1/0.07).
+\]
+
+每次 forward 还对 58 个 foreground semantic prototypes 执行固定
+`random_state=0` 的 KMeans，得到包含 background 的 \(P=30\) 个 detached
+coarse prototypes。coarse prototypes 不参与最终 predicate logits，只服务
+原版辅助正则。Source audit 原样保留五项 add-loss：
+
+\[
+\mathcal L_{2,1}^{fine}
+=\frac{\lVert C_nC_n^\top\rVert_{2,1}}{C^2},
+\qquad
+\mathcal L_{2,1}^{coarse}
+=\frac{\lVert \widetilde C_n\widetilde C_n^\top\rVert_{2,1}}{P^2},
+\]
+
+\[
+\mathcal L_{euc}^{fine}
+=\frac1C\sum_c\max(0,7-d_c^-),\qquad
+\mathcal L_{euc}^{coarse}
+=\frac1P\sum_p\max(0,7-\widetilde d_p^-),
+\]
+
+\[
+\mathcal L_{dis}
+=\frac1{|\mathcal E|}
+\sum_{(i,j)}
+\max\left(0,d_{ij}^{+}-\overline d_{ij,10}^{-}+1\right).
+\]
+
+Source audit 总损失为主 CE 加上述五项未再缩放的 source loss。该分支同时保留
+source 的历史 GloVe tokenization：object 类别只按空格取最长 token，
+predicate phrase 按空格对有效 token 求均值，不做 underscore 拆分、
+modifier-aware 校正或向量归一化。
+
+### 2.5 Current RCA: Base (Unified) and Dual-view
+
+Base、D 和 DL 使用同一 current RCA GNN；Base 与 D 的核心区别只是 relation
+adjacency。
+
+RCA 的归一化 residual GCN 为
+
+\[
+\widetilde A=A+I,\qquad
+\widehat A=D^{-1/2}\widetilde A D^{-1/2},
+\]
+
+\[
+\operatorname{GCN}(H,A)=
+\sigma(\widehat A\,\operatorname{Drop}(H)W+b+\operatorname{Drop}(H)).
+\]
+
+实体到关系的 role-specific collection 为
+
+\[
+\operatorname{Collect}_{u}(H^e,M_u)=
+\frac{M_u^\top\operatorname{ReLU}(H^eW_u+b_u)}
+{M_u^\top\mathbf 1+\epsilon},
+\qquad u\in\{s,o\}.
+\]
+
+Base 仍使用 \(A_u\)，其关系更新为
+
+\[
+H_B^{r,l+1}=\frac{1}{3}
+\left[
+\operatorname{Collect}_{s}(H^{e,l},M_s)+
+\operatorname{Collect}_{o}(H^{e,l},M_o)+
+\operatorname{GCN}_{r}(H^{r,l},A_u)
+\right].
+\]
+
+D/DL 构造
+
+\[
+A_s=\mathbb 1[M_s^\top M_s>0]-I,\qquad
+A_o=\mathbb 1[M_o^\top M_o>0]-I,
+\]
+
+并使用共享参数分别传播：
+
+\[
+H_D^{r,l+1}=\frac{1}{4}
+\left[
+\operatorname{Collect}_{s}(H^{e,l},M_s)+
+\operatorname{Collect}_{o}(H^{e,l},M_o)+
+\operatorname{GCN}_{r}(H^{r,l},A_s)+
+\operatorname{GCN}_{r}(H^{r,l},A_o)
+\right].
+\]
+
+关系输出聚合输入状态和全部更新状态：
+
+\[
+\bar H^r=\frac{1}{L+1}\sum_{l=0}^{L}H^{r,l}.
+\]
+
+随后
+
+\[
+H^{rel}=\operatorname{LayerNorm}
+\left(
+\operatorname{DownSamp}(\bar H^r)+
+\operatorname{MLP}_{res}(\operatorname{DownSamp}(\bar H^r))
+\right).
+\]
+
+PredCls 使用 \(L=4\)，SGCls/SGDet 使用 \(L=3\)。`exact_6850` dual-view
+分支还对 object states 做 all-layer mean；PredCls 返回 GT one-hot object
+logits，因此该 object-state 差异不影响 PredCls 分类结果，但会影响
+SGCls/SGDet object refinement。
+
+### 2.6 6850-compatible semantic prototype classifier（Base/D/DL）
+
+每个 predicate 使用一个 300-D GloVe prototype。设文本向量为 \(t_c\)：
+
+\[
+p_c=\operatorname{Norm}(W_pt_c),\qquad
+p_c^0=\operatorname{Norm}(W_p^0t_c).
+\]
+
+`proto_ema` 在当前 exact-6850 路线中是静态初始化锚点，不是 batch-wise
+visual EMA：
+
+\[
+\bar p_c=\operatorname{Norm}
+\left(\rho p_c+(1-\rho)p_c^0\right),\qquad \rho=0.9.
+\]
+
+relation embedding 和 predicate logits 为
+
+\[
+z_{ij}=\operatorname{Norm}(\Phi_{proj}(H_{ij}^{rel})),
+\qquad
+\ell_{ij,c}=\tau z_{ij}^{\top}\bar p_c.
+\]
+
+Base/D/DL 共同使用的 prototype regularization 为
+
+\[
+\mathcal L_{pull}
+=\lambda_{pull}\frac{1}{|\mathcal E_{train}|}
+\sum_{(i,j)}(1-z_{ij}^{\top}\bar p_{y_{ij}}),
+\]
+
+\[
+\mathcal L_{sep}
+=\lambda_{sep}\frac{1}{C(C-1)}
+\sum_{c\ne d}\left(
+\bar p_c^\top\bar p_d+\frac{1}{C-1}
+\right)^2.
+\]
+
+exact-6850 还保留固定语义 pair set \(\mathcal A\) 的历史 margin 项：
+
+\[
+\mathcal L_{ant}
+=\frac{\lambda_{ant}}{|\mathcal A|}
+\sum_{(a,b)\in\mathcal A}
+\max(0,m_{ant}-\bar p_a^\top\bar p_b).
+\]
+
+当前参数为
+\(\lambda_{pull}=0.2\)、\(\lambda_{sep}=0.01\)、
+\(\lambda_{ant}=0.1\)、\(m_{ant}=-0.2\)。这些均来自公共 RPCM-6850
+基础，不作为本文新贡献。
+
+### 2.7 Auxiliary Logit Adjustment
+
+由 train split 的 predicate counts \(n_c\) 得到
+
+\[
+\pi_c=\frac{\max(n_c,1)}{\sum_k\max(n_k,1)}.
+\]
+
+主分类损失保持
+
+\[
+\mathcal L_{CE}=\operatorname{CE}(\ell,y).
+\]
+
+DL 额外使用
+
+\[
+\mathcal L_{LA}=
+\operatorname{CE}(\ell+\tau_{LA}\log\pi,y),
+\]
+
+\[
+\mathcal L_{pred}=
+\mathcal L_{CE}
++\lambda_{LA}\mathcal L_{LA}
++\mathcal L_{pull}
++\mathcal L_{sep}
++\mathcal L_{ant},
+\]
+
+其中 \(\lambda_{LA}=0.1,\tau_{LA}=0.5\)。LA 仅改变训练梯度；推理仍使用
+原始 \(\ell\)。SGCls/SGDet 再加入 object refinement CE：
+
+\[
+\mathcal L=
+\mathcal L_{pred}+
+\mathbb 1[\text{task}\ne\text{PredCls}]\,\mathcal L_{obj}.
+\]
+
+冻结 detector 的 RPN/box losses 不参与 relation-stack 优化。PredCls 使用
+GT one-hot object outputs，`OBJECT_REFINE_LOSS_WEIGHT=0`。
+
+### 2.8 Statistical RSGP
+
+RSGP 将 candidate selection 定义为带容量正则的固定预算子图选择：
+
+\[
+\max_{\mathcal E\subseteq\mathcal E_0}
+\sum_{(i,j)\in\mathcal E}S_{ij},
+\]
+
+其优先满足
+
+\[
+|\mathcal E|\le K,\quad
+d_{out}(i)\le D_o,\quad
+d_{in}(j)\le D_i,\quad
+n_{l_i,l_j}\le Q.
+\]
+
+当前 inference-only 实现采用 greedy approximation。为避免候选不足导致与
+top-$K$ 协议不一致，它先使用严格容量、再使用放宽容量；若仍不足 $K$，最后
+从剩余 ranked pool 补齐。因此除 $|\mathcal E|\le K$ 外，degree 和
+semantic-type capacity 是选择优先级与软约束，不保证最终补齐后的图仍严格满足。
+
+#### Train-derived structural roles
+
+一次性预处理只读取 train split 的 boxes、labels 和 relation annotations。
+对 object class ID \(c\) 统计：
+
+\[
+\rho_c=\frac{1}{2}\mathbb E[q(A_i)]
++\frac{1}{2}\mathbb E[\operatorname{contain}(i)],
+\]
+
+\[
+\alpha_c=\mathbb E\left[
+1-\frac{\min(w_i,h_i)}{\max(w_i,h_i)}
+\right],
+\]
+
+\[
+\kappa_c=\mathbb E\left[
+\frac{\log(1+d_i)}{\log(1+N_i)}
+\right].
+\]
+
+三者分别表示 contextual-region、directional-alignment 和
+relational-connectivity 的软 profile。统计文件仅按 class ID 索引，不读取
+class-name string。
+
+#### Generic structural kernels
+
+几何核：
+
+\[
+S^{geom}_{ij}
+=0.35IoU^{env}_{ij}
++0.30e^{-\bar d_{ij}}
++0.20c^{compact}_{ij}
++0.15|\cos\Delta\theta_{ij}|.
+\]
+
+Context kernel 从当前图选取
+
+\[
+M=\min(128,\max(16,\lceil2\sqrt N\rceil))
+\]
+
+个高承载分实体，计算实例到 carrier 的 OBB containment、距离以及
+shared/different carrier affinity。Directional kernel 对所有合法 pair 计算
+主轴平行度、沿轴位移和横向位移；connectivity kernel 结合 class connectivity
+profile、当前 semantic degree 和距离。三者都没有 apron/vehicle/network
+类别门控。
+
+#### Frequency-adaptive support
+
+\[
+\omega_r=(f_r+\epsilon)^{-0.5},
+\qquad
+S^{rare}_{ab}
+=\max_{r:M_{abr}=1}\widetilde\omega_r.
+\]
+
+它保护可能表达低频 predicate 的 label pair，但不使用固定 hard-predicate ID。
+
+#### Multi-source utility and constrained selection
+
+\[
+S_{ij}=
+w_p\widehat S^{PPG}_{ij}
++w_n\widehat S^{PPN}_{ij}
++w_g\widehat S^{geom}_{ij}
++w_c\widehat S^{context}_{ij}
++w_a\widehat S^{align}_{ij}
++w_k\widehat S^{connect}_{ij}
++w_rS^{rare}_{ij}
++w_d\widehat S^{balance}_{ij}.
+\]
+
+当前默认：
+
+```text
+(wp, wn, wg, wc, wa, wk, wr, wd)
+= (1.0, 0.35, 0.35, 0.25, 0.10, 0.10, 0.15, 0.15)
+```
+
+候选流程：
+
+```text
+Semantic Filter
+→ PPG protected top-P, P ∈ {7000, 8000, 9000}
+→ PPN completion top-12000
+→ statistical structural top-12000
+→ hybrid utility ranking
+→ in/out degree capacity 96/96
+→ semantic-type capacity 800
+→ relaxed second pass 128/128 and 1200
+→ unconstrained ranked completion when still below top-10000
+→ final top-10000
+```
+
+paper validation grid 比较了 7000/8000/9000，并由 `selection.json` 选中
+9000。选型完成后，代码基础配置与公开脚本的 \(P\) 默认值已冻结为 9000；历史
+RSGP-v1 最优为 8000/2000，不能据此替代 statistical validation 记录。
+
+如果 \(|\mathcal E_0|\le10{,}000\)，不发生 proposal truncation，
+\(\mathcal E^*=\mathcal E_0\)。
+
+#### Legacy boundary
+
+`RSGP_ROLE_MODE=legacy_manual` 使用手工 class-name groups 和 predicate IDs
+
+```text
+[7, 14, 20, 24, 25, 28, 31, 33, 36, 38, 39, 41, 53, 56, 58]
+```
+
+仅用于复现 RSGP-v1。论文默认 `RSGP_ROLE_MODE=statistical`，完全忽略
+`RSGP_ANCHOR_CLASSES`、`RSGP_VEHICLE_CLASSES`、
+`RSGP_NETWORK_CLASSES` 和 `RSGP_TAIL_PREDICATES`。上述 ID 也正是历史
+HPRC residual head 使用的实际 predicate ID；HPRC 已排除出当前方法。
+
+### 2.9 Graph-constrained triplet inference
+
+每个候选 pair 只保留最高分前景 predicate：
+
+\[
+\hat r_{ij}=\arg\max_{c\in\{1,\ldots,58\}}p(r=c\mid i,j).
+\]
+
+triplet score 为
+
+\[
+S^{triplet}_{ij}=
+p(r=\hat r_{ij}\mid i,j)
+p(l_i\mid b_i)p(l_j\mid b_j).
+\]
+
+PredCls 的 object scores 为 1；SGCls/SGDet 使用 object confidence。
+RSGP 只改变进入关系头的候选图，不改变该最终排序定义。
 
 ---
 
-## 11. TBD 获取与回填索引
+## 3. 实验设置
 
-### 11.1 通用回填规则
+### 3.1 Dataset and tasks
 
-所有 `eval_*.sh` wrapper 都在后台启动任务。命令返回只表示进程已经启动，必须等待对应目录中的 `test_metrics.json` 写完，并确认 `test.log` 无 traceback 后再回填。
+| Item | Setting |
+|---|---:|
+| Dataset | STAR fixed split |
+| Box representation | OBB |
+| Foreground object/predicate classes | 48 / 58 |
+| Train/val/test images | 771 / 245 / 264 |
+| Train relation protocol | Single-label graph-constrained |
+| Pair budget | top-10,000 |
 
-标准 JSON 中的指标单位为 `[0,1]`，论文表格使用百分数，因此按下列字段乘以 100：
-
-```text
-R@1500   <- metrics.R["1500"]  * 100
-R@2000   <- metrics.R["2000"]  * 100
-mR@1500  <- metrics.mR["1500"] * 100
-mR@2000  <- metrics.mR["2000"] * 100
-HMR@1500 <- metrics.HR["1500"] * 100
-HMR@2000 <- metrics.HR["2000"] * 100
-```
-
-`candidate-stage-coverage.final` 等 coverage 同样乘以 100。当前 JSON 没有序列化逐 predicate recall；这部分应从同次运行的 `test.log` 中 `Per-Relation Recall` 表读取，不能混用另一个 checkpoint/filter 的日志。
-
-### 11.2 环境和可复现性字段（Section 5.6）
-
-运行：
-
-```bash
-mkdir -p outputs/paper_repro
-python tools/check_environment.py \
-  --require-cuda \
-  --output outputs/paper_repro/environment.json
-nvidia-smi --query-gpu=name,driver_version \
-  --format=csv,noheader > outputs/paper_repro/gpu.csv
-```
-
-| TBD field | Source |
-|---|---|
-| GPU model | `outputs/paper_repro/gpu.csv` 第 1 列 |
-| CUDA version | `environment.json -> mmcv_ops.torch_cuda`；同时保留 `compiled_cuda` 用于说明 mmcv 编译版本 |
-| PyTorch version | `environment.json -> packages.torch.installed` |
-| Number of runs/seeds | 当前结果应填 `1`；完成多 seed 后按实际成功运行数更新 |
-| Random seed | 当前应填 `not explicitly fixed`，而不是虚构 seed；增加全局 seed 配置并重跑后再替换 |
-
-### 11.3 SGCls/SGDet 主表（Sections 6.2–6.3）
-
-使用完全相同的 task checkpoint，只改变 inference filter：
-
-| Table row | Command | Result JSON |
-|---|---|---|
-| SGCls / PPG | `bash scripts/eval_cross_task_minimal.sh SGCLS_PPG` | `outputs/paper_cross_task/sgcls_ppg/test_metrics.json` |
-| SGCls / RSGP one-shot replay | `bash scripts/eval_cross_task_minimal.sh SGCLS_RSGP` | `outputs/paper_cross_task/sgcls_rsgp/test_metrics.json` |
-| SGDet / PPG | `bash scripts/eval_cross_task_minimal.sh SGDET_PPG` | `outputs/paper_cross_task/sgdet_ppg/test_metrics.json` |
-| SGDet / RSGP one-shot replay | `bash scripts/eval_cross_task_minimal.sh SGDET_RSGP` | `outputs/paper_cross_task/sgdet_rsgp/test_metrics.json` |
-
-SGDet 默认读取 `outputs/star_sgdet_detection_cache`。若实际使用其他 cache，命令必须显式加：
-
-```bash
-SGDET_DETECTION_CACHE_DIR=outputs/<the_exact_v5_cache> \
-bash scripts/eval_cross_task_minimal.sh SGDET_PPG
-```
-
-PPG 和 RSGP 必须使用同一个 cache hash、同一个 checkpoint 和 `SGDET_FILTER_LABEL_SOURCE=matched_gt`，否则不能作为 filter 消融。
-
-### 11.4 Existing-checkpoint PredCls ablation（Section 7.1）
-
-| ID | Checkpoint/result role | Evaluation command | Existing result JSON/log |
+| Task | Boxes | Object labels | Predicates |
 |---|---|---|---|
-| A | STAR paper-reported RPCM | none; copy Table IV | source PDF, Table IV |
-| B | `/home/ubuntu/research/ssd/RPCM/weights/6850_4135.pth` | `bash scripts/eval_predcls_minimal_ablation.sh 6850` | `outputs/paper_ablation_predcls/B_dual_rca_6850_ppg/test_metrics.json` / `test.log` |
-| C | `outputs/star_predcls_obb_tail_aux/best_bgfirst.pth` | `bash scripts/eval_predcls_minimal_ablation.sh D` | `outputs/star_predcls_obb_tail_aux_eval_ppg/test_metrics.json` / `test.log` (or standardized D output) |
-| D | same checkpoint as C | `bash scripts/eval_predcls_minimal_ablation.sh E` | `outputs/star_predcls_obb_tail_aux_eval_RSGP/test_metrics.json` / `test.log` (or standardized E output) |
+| PredCls | GT | GT | predicted |
+| SGCls | GT | predicted | predicted |
+| SGDet | predicted | predicted | predicted |
 
-Rows B–D already exist and are filled in Section 7.1. Re-running these commands
-is only a reproducibility check, not a new training requirement. Do not replace
-row B with an unfinished `_scratch` or `_ft80` model. The optional scratch
-launchers cannot be mixed into this table unless all compared variants are
-retrained and selected with a common protocol.
+### 3.2 Controlled PredCls rows
 
-### 11.5 RSGP component ablation（Section 7.4）
+| Row | Relation adjacency | GNN/update | LA | Inference filter |
+|---|---|---|:---:|---|
+| Base | unified | current RCA GNN |  | PPG |
+| D | shared-subject/shared-object | same current RCA GNN |  | PPG |
+| DL | shared-subject/shared-object | same current RCA GNN | ✓ | PPG |
+| Full | exact DL checkpoint | exact DL checkpoint | ✓ | statistical RSGP |
 
-这些实验无需重新训练 relation head：
+Base/D/DL 均只加载
+`pretrained/OBB_swin_L_OBD.pth` 的 frozen detector，relation parameters 按各自
+配置的 random/GloVe 规则从头训练。三个训练行使用相同数据、batch、optimizer、
+预算、validation filter 和 checkpoint criterion，并使用共同的
+6850-compatible initialization/classifier。因此 Base→D→DL→Full 构成严格
+单变量消融链。完整 source RPCM 只作为独立 audit，不占用主表消融行。
 
-| Variant | Command | Result JSON |
+另保留一次性决策实验 `DL-OriginalHead`：使用与 DL 相同的 current
+dual-view/all-layer RCA 和 auxiliary LA，但将 GNN 后半段替换为 2.4.1
+中的 source gated/KMeans prototype classifier。其输出目录为
+`outputs/paper_submission/predcls/dual_la_original_head/`。在 validation
+证明有效前，该行不进入主表，也不会替换现有 DL checkpoint。
+
+### 3.3 Optimization
+
+| Experiment | Batch | Optimizer | Base LR | Stop | LR milestones | Selection |
+|---|---:|---|---:|---:|---|---|
+| PredCls Base/D/DL | 16 | SGD | 0.016 | early stop; 220-epoch cap | 10,000 iters | best val HMR |
+| SGCls Dual+LA | 16 | SGD | 0.001 with configured batch scaling | 15,000 iters | 8,000, 13,000 | best val HMR |
+| SGDet Dual+LA, RPCM budget | 2 | SGD | 0.001 configured, 0.002 effective | 5,000 iters | 3,000, 4,000 | final endpoint |
+
+共同设置为 momentum 0.9、weight decay \(10^{-4}\)、gradient clipping 5.0。
+PredCls warmup 500 iterations。Base/D/DL 沿用已建立的收敛区间，从 epoch 120
+开始 validation；完整 source classifier audit 以及一次性 `DL-OriginalHead`
+决策实验尚无可靠最优区间，因此从 epoch 70 开始重新搜索。
+所有行均每 2 epoch 验证并保存 improved best checkpoint。以 \(HMR@2000\)
+为早停指标，但 patience 最早从 epoch 120 才开始累计，避免 audit 在早期搜索
+阶段因短平台提前退出；此后连续 10 次 validation（默认约 20 epochs）没有
+严格提升时终止，`min_delta=0`。220 epoch 仅为安全上限。早期 validation
+同样参与 best checkpoint 选择，最终仍使用 validation 上的
+`model_best_HR.pth`。
+
+早停状态同时写入新 checkpoint。对机制加入前产生的 checkpoint，resume 会从
+同一输出目录的 `validation_history.jsonl` 重建历史 best 和 patience，因此不会
+为了接入早停而重复已经无收益的 epoch。
+
+本实验不显式固定随机 seed；每个配置运行一次并报告单次结果，不写
+mean±std。test 不用于选 epoch 或 RSGP 超参数。
+
+### 3.4 Data-use and evaluation protocol
+
+```text
+train: optimization and construction of RSGP structural statistics
+val: checkpoint selection and RSGP mode/protected-pool selection
+test: final main results and pre-declared component ablations after freezing
+```
+
+PredCls/SGCls 使用 validation-selected `model_best_HR.pth`；固定预算 SGDet
+使用 `model_last.pth`。RSGP validation 接受规则为：
+
+\[
+HMR^{RSGP}_{2000}>HMR^{PPG}_{2000},
+\qquad
+R^{RSGP}_{2000}\ge R^{PPG}_{2000}-0.002.
+\]
+
+未通过时不能用旧 manual RSGP 结果替代 statistical RSGP。
+
+#### Val-only model and RSGP selection
+
+PredCls 的正式选型分为两个互不混用的阶段：
+
+1. **Checkpoint selection**：Base、D、DL 训练期间只在 val 上计算
+   `HMR@2000`，分别保存各自的 `model_best_HR.pth`。PPG 是三行共同的
+   validation filter，test 指标不得用于选 epoch、早停或恢复训练。
+2. **RSGP selection**：固定 DL 的 `model_best_HR.pth` 后，仅在 val 上运行
+   PPG、PPN 和 statistical RSGP grid。脚本先按上述 R/HMR 接受规则排除不合格
+   配置，再按 `HMR@2000`、`R@2000` 的字典序选择唯一方案。
+
+标准命令和产物为：
+
+```bash
+bash scripts/research/select_predcls_rsgp_on_val.sh
+```
+
+```text
+outputs/paper_submission/predcls/dual_la/rsgp_val_selection/
+├── comparison.json  # all validation-only candidates
+└── selection.json   # criterion, eligible cases and the unique selected case
+```
+
+`legacy_manual` 可以出现在 comparison 中作为历史参照，但不会进入 statistical
+候选集合。`selection.json.selected=null` 表示 statistical RSGP 未通过接受规则，
+此时 Full 不得用 test 或旧 manual 结果补选。
+
+选型完成后冻结 DL checkpoint、structural-prior 文件、`RSGP_MODE`、
+`RSGP_PPG_PROTECTED_TOPK` 和 top-10,000 budget，再对 test 各运行一次 PPG 与
+所选 RSGP。任何在生成 `selection.json` 前得到的 test 结果只能标记为 provisional；
+不能据此继续调整 RSGP 后再作为 val-only 结果报告。
+
+当前 val-only 选型已经完成，`selection.json` 冻结为
+`rsgp_hybrid_9000_1000`：
+
+| Validation filter | Statistical candidate | R@2000 | mR@2000 | HMR@2000 | GT-pair coverage | Decision |
+|---|:---:|---:|---:|---:|---:|---|
+| PPG 10000 | — | 60.85 | 39.80 | 48.12 | 72.88 | acceptance reference |
+| PPN 10000 | — | 60.14 | 38.67 | 47.07 | **86.28** | proposal reference only |
+| RSGP RS-only | ✓ | 62.77 | 41.53 | 49.99 | 74.43 | eligible |
+| RSGP PPN-graph | ✓ | **63.31** | 42.02 | 50.52 | 76.53 | eligible |
+| RSGP Hybrid 7000/3000 | ✓ | 63.03 | 42.26 | 50.60 | 70.66 | eligible |
+| RSGP Hybrid 8000/2000 | ✓ | 63.01 | 42.24 | 50.58 | 70.66 | eligible |
+| **RSGP Hybrid 9000/1000** | ✓ | 63.02 | **42.31** | **50.63** | 70.66 | **selected** |
+
+这里的 `Statistical candidate` 只表示该行进入预先声明的 statistical RSGP
+候选集合；PPG 是接受阈值，PPN 是独立 proposal reference。所有五个 RSGP
+candidate 都满足 `HMR@2000 > PPG` 且 `R@2000 >= PPG - 0.2 points`，再按
+`HMR@2000` 优先、`R@2000` 次优选择。因此 PPN-graph 虽有最高 R，最终仍由
+HMR 最高的 Hybrid 9000/1000 胜出。历史 `legacy_manual 8000/2000` 只保存在
+`comparison.json` 中供审计，不参与 statistical selection。
+
+相对 PPG，选中配置在 val 上取得 +2.17 R、+2.51 mR 和 +2.51 HMR
+points，因此通过接受规则。后续 PredCls、SGCls 和 SGDet 的 paper-facing RSGP
+test 默认固定 `RSGP_MODE=HYBRID`、`RSGP_PPG_PROTECTED_TOPK=9000`；不再使用
+历史 8000/2000 默认值。
+
+在冻结 9000/1000 pool split 后，又在 **val** 上执行了一次预先隔离的结构角色
+保留/删除检查，用于解决 test component table 中方向不一致的问题：
+
+| Val variant | R@2000 | mR@2000 | HMR@2000 | GT-pair coverage |
+|---|---:|---:|---:|---:|
+| Full statistical RSGP | **63.02** | **42.31** | **50.63** | 70.66 |
+| w/o contextual/alignment/connectivity roles | 62.82 | 42.11 | 50.42 | **72.35** |
+
+Full 分别高出 +0.20 R、+0.21 mR 和 +0.21 HMR points。因而最终版本保留
+train-derived contextual-region、directional-alignment 和
+relational-connectivity 三类软结构角色。该结论只由 val 决定；test 上
+`w/o structural roles` 的 +0.06 HMR 波动不用于反向修改方法。最终冻结记录位于
+`outputs/paper_submission/predcls/dual_la/rsgp_finalization_val/final_selection.json`。
+
+最终 paper-facing 配置为：statistical role mode、Hybrid 9000/1000、总预算
+10,000、PPN/geometry/three structural roles/rarity/degree control/semantic
+capacity 全部启用。项目内 PredCls、SGCls、SGDet 与公开评估脚本的默认 protected
+pool 已统一为 9000；7000/8000 仅保留为历史 grid 结果。
+
+### 3.5 Main metrics
+
+对第 \(n\) 张图的 GT 有向 pair 集 \(G_n\) 和 top-\(K\) 命中集合
+\(M_n^K\)：
+
+\[
+R@K=\frac{1}{T}\sum_{n=1}^{T}
+\frac{|M_n^K|}{\max(|G_n|,1)}.
+\]
+
+对前景 predicate \(c\)：
+
+\[
+R_c@K=\frac{1}{|T_c|}
+\sum_{n\in T_c}\frac{|M_{n,c}^K|}{|G_{n,c}|},
+\]
+
+\[
+mR@K=\frac{1}{58}\sum_{c=1}^{58}R_c@K,
+\]
+
+\[
+HMR@K=
+\frac{2(R@K)(mR@K)}{R@K+mR@K}.
+\]
+
+主表报告 \(K=1500,2000\)，补充材料报告 \(K=1000\)。所有行使用同一
+graph-constrained evaluator。
+
+### 3.6 Candidate-graph metrics
+
+同 checkpoint 的 PPG、PPN、RSGP 还报告：
+
+- **GT-pair coverage**：逐 GT relation row 检查其 subject-object pair
+  是否在最终 candidate graph 中，再以全部 GT relation rows 为分母；因此同一
+  pair 若有多个 GT predicates，会按 relation row 重复计权；
+- **node coverage**：至少出现在一条 candidate edge 中的实体比例；
+- **degree Gini**：每图有向边 incidence degree 的 Gini，再对图像平均；
+- **maximum degree**：整个 split 中单个节点的最大 incidence degree；
+- **label-pair entropy**：每图候选边的 \((l_s,l_o)\) 分布熵，再对图像平均。
+
+这些指标描述候选图结构，不等同于 relation prediction accuracy。尤其是
+更高 GT-pair coverage 并不保证更高 triplet R/mR/HMR。
+
+### 3.7 Candidate-pressure analysis
+
+pressure 使用 **Semantic Filter 后、top-10,000 前** 的候选数分组：
+
+| Pressure group | Semantic-filtered candidate count |
+| :--- | ---: |
+| No truncation | ≤ 10,000 |
+| Low overload | 10,001–20,000 |
+| Medium overload | 20,001–50,000 |
+| High overload | > 50,000 |
+
+`no_truncation` 仅表示 pair proposal 不需要裁剪；最终 evaluator 仍按
+triplet top-1000/1500/2000 排序。分组 R 是组内 image recall 的平均值；
+分组 mR 仍对固定 predicate vocabulary 做 macro aggregation，因此会同时受
+组内 predicate 分布影响。不同 pressure 组之间不能直接解释为“模型性能随候选
+规模单调下降”；关键受控证据是在同一组内比较 PPG 与 RSGP。
+
+最终 DL checkpoint 上的同权重 PPG/RSGP pressure 对比已经完成：
+
+| Pressure group | Images | R: PPG → RSGP (%) | mR: PPG → RSGP (%) | HMR: PPG → RSGP (%) |
+| :--- | ---: | ---: | ---: | ---: |
+| No truncation | 160 | 74.01 → 74.01 | 52.10 → 52.10 | 61.15 → 61.15 |
+| Low overload | 28 | 68.98 → **69.38** | 34.17 → **36.16** | 45.70 → **47.54** |
+| Medium overload | 32 | 65.72 → **69.29** | 25.16 → **27.43** | 36.39 → **39.30** |
+| High overload | 44 | 41.81 → **47.80** | 20.01 → **23.17** | 27.07 → **31.21** |
+
+无需裁剪时两种方法完全一致；从 low 到 high overload，RSGP 的 HMR 增益分别
+为 +1.84、+2.91 和 +4.14 points。这是固定 top-10,000 预算下最直接的压力证据，
+且不要求不同 pressure group 之间的绝对性能单调变化。来源分别为 DL/PPG 与
+Full RSGP 的正式 test JSON，因此无需新增 pressure 实验。
+
+---
+
+## 4. 结果表
+
+### 4.1 Controlled PredCls ablation（paper main）
+
+| Row | R@1500 | R@2000 | mR@1500 | mR@2000 | HMR@1500 | HMR@2000 | Source |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Base (Unified) | **68.63** | **70.39** | 39.77 | 40.98 | 50.36 | 51.80 | `outputs/paper_submission/predcls/unified/test/ppg/test_metrics.json` |
+| D | 68.12 | 69.68 | 41.02 | 42.18 | 51.21 | 52.55 | `outputs/paper_submission/predcls/dual/test/ppg/test_metrics.json` |
+| DL | 65.46 | 67.11 | 41.99 | 43.42 | 51.16 | 52.72 | `outputs/paper_submission/predcls/dual_la/test/ppg/test_metrics.json` |
+| Full | 67.23 | 68.58 | **43.82** | **45.38** | **53.06** | **54.62** | selected 9000/1000; `outputs/paper_submission/predcls/dual_la/rsgp_component_test/rsgp_full/test_metrics.json` |
+
+表中 Base→D→DL→Full 构成严格受控消融链。Base 是原实验目录中的 Unified
+checkpoint，不是完整 SGG-ToolKit source predictor；source RPCM 仅在审计实验中
+报告。串行 suite 会自动跳过已完成行、续训中断行并依次运行。
+
+当前 test 结果在 $K=2000$ 下的逐步变化为：
+
+| Transition | ΔR | ΔmR | ΔHMR | Evidence |
+|---|---:|---:|---:|---|
+| Base → D | -0.71 | +1.20 | +0.75 | dual view 改善类别均衡和综合指标，但并未提高总体 R |
+| D → DL | -2.58 | +1.24 | +0.17 | LA 明显偏向 macro recall，HMR 仅小幅提高且存在 R 代价 |
+| DL → Full | **+1.47** | **+1.96** | **+1.90** | 同一 checkpoint 只替换 PPG 为 statistical RSGP，三项指标同时提高 |
+| Base → Full | -1.81 | +4.40 | +2.82 | 完整方法主要提升 mR/HMR，而非保持最高 micro-style R |
+
+因此，这组结果支持以下较窄且可验证的论点：dual view 和 LA 逐步改善
+class-balanced recall；statistical RSGP 在不重训关系模型的条件下同时恢复 R、
+提高 mR，并取得最高 HMR。它**不支持**“dual view/LA 的每一步都不降低 R”或
+“Full 在所有指标上都优于 Base”这两种更强表述。
+
+DL checkpoint 上的同权重 candidate-graph 对比如下：
+
+| Filter | GT-pair coverage | Node coverage | Degree Gini | Maximum degree | Label-pair entropy | R@2000 | mR@2000 | HMR@2000 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PPG | **79.89** | 99.28 | **0.1637** | **252** | 1.8587 | 67.11 | 43.42 | 52.72 |
+| statistical RSGP | 75.33 | **99.42** | 0.1694 | 740 | **2.0263** | **68.58** | **45.38** | **54.62** |
+
+RSGP 在较低 GT-pair coverage 下获得更高的 downstream R/mR/HMR，直接支持
+“pair coverage 不是候选图质量的充分条件”；更高的 label-pair entropy 也支持
+其增加语义类型多样性的论点。不过，当前结果的 degree Gini 和 maximum degree
+均未优于 PPG，不能用它证明最终图的度数更均衡。实现会在受约束的两轮选择仍
+不足 top-10,000 时执行无约束补齐，因此论文应将 degree/semantic capacity
+表述为 greedy selection 中的软容量控制，而不是最终图必然满足的硬约束。
+
+按 3.4 节预先写下的接受规则，validation 选择了 Hybrid 9000/1000；上述 Full
+已使用相同 DL checkpoint 和冻结配置完成 test。相对 PPG，Full 在 test 上取得
++1.47 R、+1.96 mR 和 +1.90 HMR points。不得再根据 test 结果修改 RSGP
+超参数。
+
+### 4.2 Historical filter evidence
+
+以下三行来自同一个历史 HPRC checkpoint，只用于证明“pair coverage 不是充分
+目标”。原 checkpoint 已不在当前 workspace，因此不能作为投稿主结果：
+
+| Filter | GT-pair coverage | R@2000 | mR@2000 | HMR@2000 |
+|---|---:|---:|---:|---:|
+| PPG | 79.89 | 69.19 | 44.17 | 53.92 |
+| PPN | **91.24** | 68.88 | 43.43 | 53.27 |
+| RSGP-v1/manual Hybrid 8000/2000 | 75.98 | **71.08** | **45.96** | **55.82** |
+
+### 4.3 Cross-task comparison with RPCM
+
+以下结果使用 STAR/SGG-ToolKit 的 filter-label 协议，直接用于与 RPCM 报告值
+进行三任务完整对比：
+
+| Task/method | R@1500 | R@2000 | mR@1500 | mR@2000 | HMR@1500 | HMR@2000 |
+|---|---:|---:|---:|---:|---:|---:|
+| STAR SGCls RPCM | 51.29 | 52.72 | 30.04 | 30.85 | 37.89 | 38.92 |
+| Ours SGCls, PPG | 54.17 | 55.47 | 30.71 | 31.63 | 39.20 | 40.29 |
+| **Ours SGCls, RSGP** | **56.75** | **57.78** | **32.90** | **33.75** | **41.65** | **42.61** |
+| STAR SGDet RPCM | 27.23 | 28.50 | 11.53 | 12.07 | 16.20 | 16.96 |
+| Ours SGDet, PPG | 32.51 | 33.21 | 13.79 | 14.28 | 19.36 | 19.97 |
+| **Ours SGDet, RSGP** | **32.98** | **33.65** | **14.11** | **14.55** | **19.76** | **20.31** |
+
+在 @2000 下，相对 RPCM，Ours+RSGP 在 SGCls 上提高 +5.06 R、+2.90 mR、
++3.69 HMR，在 SGDet 上提高 +5.15 R、+2.48 mR、+3.35 HMR。固定本项目模型
+后将 PPG 替换为 RSGP，SGCls 再提高 +2.31 R、+2.11 mR、+2.32 HMR；SGDet
+提高 +0.44 R、+0.27 mR、+0.34 HMR。
+
+额外的 predicted-label filtering 结果如下，用于展示不使用 GT/matched-GT
+filter labels 时的性能：
+
+| Task/method | R@1500 | R@2000 | mR@1500 | mR@2000 | HMR@1500 | HMR@2000 |
+|---|---:|---:|---:|---:|---:|---:|
+| SGCls, PPG | 45.79 | 46.78 | 25.50 | 26.09 | 32.76 | 33.50 |
+| **SGCls, RSGP** | **46.69** | **47.40** | **26.06** | **26.56** | **33.45** | **34.05** |
+| SGDet, PPG | 29.21 | 30.26 | 11.62 | 12.39 | 16.63 | 17.58 |
+| **SGDet, RSGP** | **29.84** | **30.90** | **12.10** | **12.85** | **17.22** | **18.15** |
+
+正式结果来源为
+`outputs/paper_submission/{sgcls,sgdet_rpcm_budget}/test/`；历史 manual
+RSGP 结果不再用于该表。
+
+### 4.4 Statistical RSGP component ablation（test, frozen protocol）
+
+| Variant | PPN | Geometry | Statistical roles | Degree control | Semantic capacity | Rarity | R@2000 | mR@2000 | HMR@2000 |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|---:|---:|---:|
+| Full | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | 68.58 | **45.38** | 54.62 |
+| w/o PPN completion |  | ✓ | ✓ | ✓ | ✓ | ✓ | 68.35 | 45.24 | 54.45 |
+| w/o geometry | ✓ |  | ✓ | ✓ | ✓ | ✓ | 68.66 | 45.24 | 54.54 |
+| w/o structural roles | ✓ | ✓ |  | ✓ | ✓ | ✓ | **68.80** | 45.36 | **54.68** |
+| w/o degree control | ✓ | ✓ | ✓ |  | ✓ | ✓ | 68.37 | 45.11 | 54.36 |
+| w/o semantic capacity | ✓ | ✓ | ✓ | ✓ |  | ✓ | 67.85 | 44.33 | 53.62 |
+| w/o rarity support | ✓ | ✓ | ✓ | ✓ | ✓ |  | 68.31 | 45.25 | 54.43 |
+
+这些行不是候选超参数，而是预先声明的 remove-one-component 诊断。Hybrid
+9000/1000 已由 val 冻结后，各行在 test 上只运行一次，统一使用同一 DL
+checkpoint；结果不得反向用于修改组件、权重或容量设置。`NO_RS` 同时删除多个
+模块，不属于该受控表。`w/o geometry` 使用新增的独立开关，仅关闭通用 OBB
+geometry utility，仍保留 statistical structural roles，因而不与 `NO_RS` 混淆。
+
+相对对应 ablation，Full 的 @2000 增量为：
+
+| Restored component | ΔR | ΔmR | ΔHMR | Interpretation |
+|---|---:|---:|---:|---|
+| PPN completion | +0.22 | +0.14 | +0.17 | 小幅 test-side 正贡献 |
+| OBB geometry utility | -0.08 | +0.14 | +0.08 | 轻微从总体 R 重分配到 macro recall |
+| statistical structural roles | -0.22 | +0.02 | -0.06 | 仅轻微重分配到 macro recall，不能声称提高综合性能 |
+| degree control | +0.21 | +0.27 | +0.26 | test remove-one 中为正 |
+| semantic capacity | +0.73 | +1.05 | +0.99 | 最大的 test-side removal effect |
+| rarity support | +0.27 | +0.14 | +0.18 | 小幅 test-side 正贡献 |
+
+为了避免把单次 test remove-one 结果误写成稳定的 component selection，下面进一步
+列出已有 validation 证据。所有数值均为 `Full − reference/ablated` 的
+HMR@2000 百分点；正数表示 Full 更高：
+
+| Comparison | Val ΔHMR | Test ΔHMR | Evidence boundary |
+|---|---:|---:|---|
+| Full RSGP − PPG | **+2.51** | **+1.90** | 整体候选图方法在两个 split 上方向一致 |
+| Full − w/o PPN completion | -0.05 | +0.17 | 极小且方向反转；只能称为多源互补设计，不能声称独立稳定增益 |
+| Full − w/o geometry | ≈0.00 | +0.08 | val 基本中性，test 上仅小幅改善 macro balance |
+| Full − w/o structural roles | **+0.21** | -0.06 | 按 val 保留的辅助结构证据；test 上存在轻微反转 |
+| Full − w/o degree control | +0.04 | +0.26 | 两个 split 同方向，val 影响很小 |
+| Full − w/o semantic capacity | **+1.50** | **+0.99** | 两个 split 中均为最强的选择约束 |
+| Full − w/o rarity support | +0.19 | +0.18 | 小幅但跨 split 高度一致 |
+
+除前述 structural-role finalization 外，degree/capacity/rarity/geometry 的 val
+行是在冻结最终配置后补做的 **post-freeze consistency audit**，只用于限定组件
+结论，不构成新的模型选择，也不触发重新测试。
+`w/o PPN completion` 的 val 结果来自已有一致性检查，但它不在预先声明的 pool/mode
+selection grid 中，因此没有用于事后改变 Full 定义。表中真正稳定的主结论是：
+**完整 RSGP 相对 PPG 的 HMR 增益在 val 和 test 上均成立**。组件层面的结论应更
+具体：semantic capacity 是两个 split 中最强且稳定的选择约束；rarity support
+提供高度一致的小幅增益；degree control 同方向但 val 影响较小；geometry 在 val
+近似中性、test 上略改善 HMR；PPN completion 和 structural roles 则存在轻微
+split reversal，不能作为独立稳定增益来表述。
+
+所有 variant 在 160 张无需截断的图上结果完全一致，说明这些模块只改变
+top-10,000 超载场景，符合设计边界。结构角色在 low overload 上有轻微正贡献，
+并在 medium/high overload 中略增 mR，但同时降低 R，导致全测试集 HMR 比
+`w/o structural roles` 低 0.06 points。这个 test remove-one 结果不能用于删除
+组件；上面的独立 val finalization 显示 Full 高 0.21 HMR points，因而最终版本
+仍保留这些角色。论文应将其谨慎描述为 **validation-selected auxiliary structural
+evidence**，而不是声称它在每个 split 上都有稳定的独立增益。
+
+### 4.5 Per-predicate supplement and qualitative cases
+
+完整 58 类 Base/D/DL/Full 的 @2000 recall 表已经提取到
+[per_predicate_supplement.md](per_predicate_supplement.md)。机器可读版本位于：
+
+```text
+outputs/paper_submission/supplement/per_predicate_ablation.{csv,json}
+outputs/paper_submission/supplement/per_predicate_filter_ppg_vs_rsgp.{csv,json}
+```
+
+在固定 DL checkpoint 上只将 PPG 替换为 statistical RSGP 时，@2000 下
+58 类中 32 类提高、16 类不变、10 类下降。变化最大的代表类如下；`Pair cov.`
+是该 predicate 的 GT relation row 最终进入候选图的比例：
+
+| Predicate | Count | PPG R | RSGP R | ΔR | PPG pair cov. | RSGP pair cov. |
+|---|---:|---:|---:|---:|---:|---:|
+| around | 152 | 33.77 | **55.06** | **+21.29** | 65.13 | 98.68 |
+| parallelly docked at | 2891 | 64.39 | **76.92** | **+12.53** | 82.01 | 92.94 |
+| approach | 930 | 40.01 | **51.54** | **+11.53** | 72.04 | 94.84 |
+| run along | 219 | 73.61 | **83.86** | **+10.25** | 80.82 | 95.43 |
+| docking at the different dock with | 525 | 30.29 | **40.36** | **+10.07** | 72.19 | 71.05 |
+| parking in the different apron with | 18104 | **45.57** | 39.26 | -6.31 | 46.53 | 24.84 |
+| running along the different taxiway with | 466 | **29.23** | 24.05 | -5.18 | 33.26 | 18.45 |
+| in the different parking with | 509 | **47.08** | 42.17 | -4.91 | 87.03 | 69.55 |
+
+这组结果应作两点克制解释。第一，多数大幅提高类别同时获得了更高候选覆盖，
+说明 RSGP 的收益来自固定预算下的候选重分配；第二，候选覆盖下降明显的 apron/
+taxiway 类会退化，因此不能声称 RSGP 对每个 predicate 都提高。与此同时，
+`docking at the different dock with` 在 pair coverage 略降时仍提高 10.07 points，
+再次说明 pair coverage 不是 downstream relation quality 的充分统计量。
+Full 还把 DL 的零召回类别数从 5 降到 3：`randomly docked at` 从 0 提高到
+1.50，`not working on` 从 0 提高到 1.92；仍为零的三类中有两类在 test 中仅有
+2 和 13 个样本，因此不应只按“零类数量”评价整体方法。
+
+当前案例选择已经固定为：
+
+| Use | Image ID | Pressure | Semantic pairs | GT pairs | PPG Triplet R | RSGP Triplet R | Δ |
+|---|---:|---|---:|---:|---:|---:|---:|
+| main success | 440 | overload medium | 46,048 | 446 | 54.71 | **84.98** | **+30.27** |
+| second filtered success | 748 | overload medium | 45,332 | 240 | 17.08 | **50.83** | **+33.75** |
+| main failure | 235 | overload high | 63,032 | 865 | **40.58** | 30.52 | -10.06 |
+
+主文使用 `440/748/235` 三张：分别展示机场枢纽场景中命中翻倍且输出收缩、
+多组件场景中的显著改善，以及 semantic-capacity 重分配造成的明确失败。三张图的
+Semantic Filter 候选数均超过 10,000，因此 PPG 和 RSGP 的 top-10,000
+过滤都被实际执行。表中的 `Triplet R` 来自同一 relation checkpoint 的最终
+graph-constrained top-2,000 预测，不是候选 pair coverage。具体实体/关系构成、
+源图路径和缩略图位于：
+
+```text
+outputs/paper_submission/supplement/qualitative_cases.{md,json}
+outputs/paper_submission/supplement/case_thumbnails/
+```
+
+复现提取过程：
+
+```bash
+python tools/extract_paper_supplement.py --render-thumbnails
+```
+
+原始卫星图过大，不应直接在底图上叠加全部关系边。下面的一键脚本仅推理
+`440/748/235`，并输出“卫星裁剪图 + GT scene graph + PPG scene graph + RSGP
+scene graph”。三张图使用完全一致的节点坐标、节点 ID 和类别颜色；裁剪区域内
+全部 GT 实体均被保留。图中不标注具体 predicate 名称，以免文字遮挡遥感场景中
+密集的小目标；灰色表示 GT 关系，绿色为匹配 GT 的实际输出，蓝色为 RSGP-only
+正确输出，紫色为 PPG-only 正确输出。蓝色或紫色虚线圈叉表示“该正确关系只被
+另一方法预测，本面板缺失”，它只是跨方法对照参考，不是本面板的模型输出；
+红色虚线则是本方法实际输出但未匹配现有 GT 的预测。节点布局在保持原始空间
+投影的前提下强制最小间距。仅对 image `440` 使用可视化层面的局部微调：下方
+枢纽轻微下移，上方扇区横向展开，左侧扇区向外平移，右侧扇区保持锚定；b/c/d
+严格共享调整后的坐标，预测与指标不变。该密集案例的三位节点编号使用自适应
+字号，稀疏案例保持原排版。同一
+有向实体对上的多个 predicate 在图中合并为一条结构边，反向实体对则使用
+分离的浅曲线路由。所有 GT 实体和全部有向 GT pair 均按与预测面板相同的线宽
+绘制，完整 pair 列表同时保存在 artifact 和 manifest 中。弧线路由只根据各面板
+实际显示的边计算，未显示的反向预测不会使孤立可见边发生弯曲。精确 triplet
+数和结果仍保存在标题及 manifest 中：
+
+```bash
+bash scripts/research/export_paper_qualitative_cases.sh
+```
+
+结果位于：
+
+```text
+outputs/paper_submission/qualitative_figures/scene_graphs/
+  0440_spatial_scene_graph.png
+  0748_spatial_scene_graph.png
+  0235_spatial_scene_graph.png
+  scene_graph_manifest.json
+```
+
+预测图绘制局部全部 GT-matched top-2,000 输出，并仅保留最高分的 8 条
+GT-unmatched 输出以控制可读性；manifest 保存未截断的局部预测数和匹配数。
+脚本会拒绝未真正发生候选截断的案例，不训练模型，也不改变最终数值结果。
+
+### 三张定性图的具体解读
+
+**Image 440：机场枢纽场景中的主要成功案例。** 裁剪区域包含 68 个实体和
+105 个 GT triplet（对应 105 个有向实体对），全部在 GT 面板中绘制。该区域
+主要由 terminal/apron 与分布在
+周围的 airplane、boarding bridge 和 taxiway 组成。PPG 在 562 个局部输出中
+命中 40 个，RSGP 在仅 305 个局部输出中命中 80 个：输出数量减少约 46%，正确
+命中数却翻倍；image-level Triplet R 从 54.71% 提高到 84.98%。绿色与蓝色边
+显示 RSGP 更完整地恢复了围绕 terminal/apron 枢纽的局部关系，同时避免 PPG
+产生的大量未匹配输出。因此该案例同时体现候选图的有效性与选择性，而不只是
+候选数量变化。
+
+**Image 748：候选数量不等于下游质量的第二个成功案例。** 该区域包含 26 个实体
+和 22 个 GT 有向 pair，并呈现多个空间分离的局部连通分量。PPG 产生 174 个
+局部输出但只命中 4 个，RSGP 将局部输出减少到 108 个的同时命中 18 个；命中数
+提高 4.5 倍，image-level Triplet R 从 17.08% 提高到 50.83%。图中 RSGP 保留了
+更多与 GT 局部组件一致的边，并减少若干跨组件的长距离未匹配输出。这是论文中
+支撑“更高 pair/output 数量并不保证更优关系图”的最直观证据。需要注明，红色
+虚线只展示分数最高的 8 个 GT-unmatched 输出，而且 STAR 标注并非穷尽，因此
+不能把红边数量直接解释为精确的 false-positive 数。
+
+**Image 235：同质密集子图上的明确失败。** 裁剪区域只有 6 个 tank 实体，但
+形成 16 个 GT 有向 pair。PPG 在 24 个局部输出中命中全部 16 个，RSGP 在 15 个
+输出中仅命中 1 个；image-level Triplet R 从 40.58% 降至 30.52%。紫色实线表示
+PPG-only 正确输出，RSGP 面板中的带圈叉虚线表示相应 pair 缺失。该现象与图容量
+机制在全图高负载条件下将预算从高度重复的同质局部模式中移走相一致，说明强调
+语义多样性和度数平衡可能误伤真实的密集同类关系。因此该失败案例应与两个成功
+案例共同报告，并在 limitation 中作为未来自适应 capacity 控制的动机。
+
+---
+
+## 5. 实验命令
+
+### 5.1 PredCls controlled suite
+
+```bash
+# Base(Unified) → D → DL 串行；完成一行后自动用 best val-HMR checkpoint 跑 PPG test
+bash scripts/research/run_paper_predcls_suite.sh
+
+# 在 DL checkpoint 上用 val 选择 statistical RSGP
+bash scripts/research/select_predcls_rsgp_on_val.sh
+
+# 用 val 选中的 9000/1000 配置完成正式 Full test
+RUN_BACKGROUND=0 bash scripts/research/eval_predcls_rsgp_ablation.sh FULL
+
+# 汇总冻结后的结果
+python tools/summarize_paper_experiments.py
+```
+
+单行训练：
+
+```bash
+bash scripts/research/run_predcls_minimal_ablation.sh BASE
+bash scripts/research/run_predcls_minimal_ablation.sh D
+bash scripts/research/run_predcls_minimal_ablation.sh DL
+
+# 可选 source-RPCM 审计，不属于主消融链
+bash scripts/research/run_predcls_minimal_ablation.sh SOURCE
+```
+
+suite 以 `<row>/test/ppg/test_metrics.json` 判定完成；重启时跳过完成行并从
+`model_last.pth` 自动续训中断行。`CASES=BASE,D` 可限制队列。
+
+### 5.2 Statistical prior and RSGP ablation
+
+```bash
+bash scripts/build_rsgp_structural_prior.sh
+
+bash scripts/research/eval_predcls_rsgp_ablation.sh FULL
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_PPN
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_GEOMETRY
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_STRUCTURE
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_DEGREE
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_QUOTA
+bash scripts/research/eval_predcls_rsgp_ablation.sh NO_RARITY
+```
+
+### 5.3 SGCls and SGDet
+
+```bash
+# SGDet train/val/test cache 必须使用同一 v5 detector hash
+SPLITS=val OVERWRITE=0 bash scripts/build_sgdet_detection_cache.sh
+
+bash scripts/research/run_star_sgcls_experiment.sh
+bash scripts/research/run_star_sgdet_rpcm_budget.sh
+bash scripts/research/eval_paper_cross_task_suite.sh
+```
+
+cross-task suite 生成：
+
+```text
+legacy: SGCls gt filter labels; SGDet matched_gt filter labels
+pred:   strict predicted filter labels
+```
+
+PPG/RSGP 对比必须使用完全相同的 task checkpoint、detection cache、
+label-source protocol 和 evaluator。
+
+---
+
+## 6. 结果来源与回填规则
+
+### 6.1 Authoritative outputs
+
+```text
+outputs/paper_submission/
+├── predcls/
+│   ├── unified/       # paper Base
+│   ├── dual/
+│   ├── dual_la/
+│   └── base_original/ # optional source audit
+├── rpcm_audit/
+├── sgcls/
+└── sgdet_rpcm_budget/
+```
+
+旧开发结果均在 `outputs_old/`，只能填入明确标记为 historical/archive 的表。
+
+标准 JSON 路径中的值为 \([0,1]\)，论文表乘以 100：
+
+```text
+R@K   <- metrics.R[str(K)]  * 100
+mR@K  <- metrics.mR[str(K)] * 100
+HMR@K <- metrics.HR[str(K)] * 100
+```
+
+逐 predicate recall 从同次运行的 `test.log` 中
+`Per-Relation Recall` 读取。不要混用另一个 checkpoint 或 filter 的日志。
+新 evaluator 还会把同样的数据写入 JSON 的 `per-predicate-recall`、
+`predicate-counts` 和 `per-image`；旧正式结果仍由上述提取工具兼容解析日志。
+
+### 6.2 PredCls main provenance
+
+| Row | Result JSON |
+|---|---|
+| Base (Unified) | `outputs/paper_submission/predcls/unified/test/ppg/test_metrics.json` |
+| D | `outputs/paper_submission/predcls/dual/test/ppg/test_metrics.json` |
+| DL | `outputs/paper_submission/predcls/dual_la/test/ppg/test_metrics.json` |
+| Full | `outputs/paper_submission/predcls/dual_la/rsgp_component_test/rsgp_full/test_metrics.json` |
+| DL + PPN diagnostic | `outputs/paper_submission/predcls/dual_la/test/ppn/test_metrics.json` |
+| Source RPCM audit | `outputs/paper_submission/predcls/base_original/test/ppg/test_metrics.json` |
+
+### 6.3 Cross-task provenance
+
+| Row | Result JSON |
+|---|---|
+| SGCls PPG | `outputs/paper_submission/sgcls/test/legacy/ppg/test_metrics.json` |
+| SGCls statistical RSGP | `outputs/paper_submission/sgcls/test/legacy/rsgp_statistical/test_metrics.json` |
+| SGDet PPG | `outputs/paper_submission/sgdet_rpcm_budget/test/legacy/ppg/test_metrics.json` |
+| SGDet statistical RSGP | `outputs/paper_submission/sgdet_rpcm_budget/test/legacy/rsgp_statistical/test_metrics.json` |
+
+strict `pred` 结果位于相同 task 目录的 `test/pred/` 分支。
+
+### 6.4 Historical provenance
+
+```text
+STAR paper:
+  Star A first-ever dataset and a large-scale benchmark for scene graph
+  generation in large-size satellite imagery.pdf
+
+RPCM-6850:
+  checkpoint: /home/ubuntu/research/ssd/RPCM/weights/6850_4135.pth
+  replay: outputs_old/paper_ablation_predcls/B_dual_rca_6850_ppg/
+
+Historical Dual+LA/manual RSGP:
+  outputs_old/paper_ablation_predcls/
+  outputs_old/rsgp_grid/
+
+Historical SGCls/SGDet:
+  outputs_old/paper_cross_task/
+  outputs/star_sgdet_obb_dual_la_rpcm_budget_eval_last_{ppg,rsgp}/
+
+Recovered compatible checkpoints:
+  outputs/star_sgcls_obb_dual_la_train/
+  outputs/star_sgdet_obb_dual_la_rpcm_budget/
+```
+
+`6850_4135.pth` 的名称记录历史 iteration 17,600 的
+R@1500/mR@1500=`0.6850/0.4135`；当前项目 replay 为
+`0.6812/0.4102`。两者不能静默互换。
+
+### 6.5 Final completion audit
+
+| Group | State | Remaining action |
 |---|---|---|
-| Full RSGP | `bash scripts/eval_predcls_rsgp_ablation.sh FULL` | `outputs/paper_ablation_rsgp/rsgp_full/test_metrics.json` |
-| w/o PPN completion | `bash scripts/eval_predcls_rsgp_ablation.sh NO_PPN` | `outputs/paper_ablation_rsgp/rsgp_no_ppn_completion/test_metrics.json` |
-| w/o RS priors | `bash scripts/eval_predcls_rsgp_ablation.sh NO_RS` | `outputs/paper_ablation_rsgp/rsgp_no_rs_priors/test_metrics.json` |
-| w/o degree control | `bash scripts/eval_predcls_rsgp_ablation.sh NO_DEGREE` | `outputs/paper_ablation_rsgp/rsgp_no_degree_control/test_metrics.json` |
-| w/o label-pair quota | `bash scripts/eval_predcls_rsgp_ablation.sh NO_QUOTA` | `outputs/paper_ablation_rsgp/rsgp_no_label_pair_quota/test_metrics.json` |
-| w/o hard-predicate prior | `bash scripts/eval_predcls_rsgp_ablation.sh NO_TAIL` | `outputs/paper_ablation_rsgp/rsgp_no_tail_prior/test_metrics.json` |
+| PredCls Base/D/DL | main test metrics complete | none |
+| PredCls Full | val-selected Hybrid 9000/1000 test complete | none |
+| RSGP pool/role selection | val grid and final role decision complete | none |
+| Statistical RSGP component ablation | Full plus six frozen-protocol remove-one rows complete | none |
+| Candidate-graph and pressure analysis | same-checkpoint PPG/RSGP results complete | only format figures/tables |
+| Source RPCM audit | PPG test complete; optional and outside main table | none |
+| SGDet v5 detection cache | train/val/test complete: 771/245/264 images | none |
+| Cross-task SGCls | PPG/RSGP under both filter-label protocols complete | none |
+| Same-budget SGDet | PPG/RSGP under both filter-label protocols complete | none |
+| Per-predicate supplement | 58-class table and machine-readable CSV/JSON complete | none |
+| Qualitative prediction cases | exact actively filtered cases `440/748/235` rendered as aligned GT/PPG/RSGP scene graphs from final top-2,000 outputs | none |
 
-Section 7.4 只取上述 JSON 的 `@2000` 三项指标。`FULL` 应先与 Section 6.1 的 RSGP 行数值对齐；若不一致，先检查 checkpoint 和环境变量，不应直接填表。
+严格按运行记录审计时还需注意：DL 主训练在 epoch 204 被手动终止，训练
+`exit_code=143`；其 best checkpoint 来自 epoch 144，之后 29 次 validation 均未
+超过该值。现有 test/RSGP 结果因此数值上可用，但若投稿材料或开源审计要求每条
+训练都有干净终止状态，应从 `model_last.pth` 续跑至 early stop 或 epoch 220。
+只有续跑产生新的 `model_best_HR.pth` 时，才需要重跑 DL 的 PPG、PPN、RSGP、
+component 与 pressure 评估；否则现有结果保持不变。
 
-### 11.6 HPRC hard-predicate table（Section 7.5）
+### 6.6 Experiment completion
 
-该表已经由 6850 base 和 HPRC checkpoint 的两次 PPG evaluation
-回填，不需要增加实验分支：
+当前所有计划内数值实验均已完成。机器汇总中
+`completion.missing_cross_task=[]`。重新生成汇总使用：
 
-| Column | Source |
-|---|---|
-| Count | `outputs/paper_ablation_predcls/B_dual_rca_6850_ppg/test.log` 的对应 predicate 行 `count` |
-| Before HPRC R@2000 | `outputs/paper_ablation_predcls/B_dual_rca_6850_ppg/test.log` |
-| After HPRC R@2000 | `outputs/star_predcls_obb_tail_aux_eval_ppg/test.log` |
-| Delta | `After - Before`，统一按百分点报告 |
+```bash
+python tools/summarize_paper_experiments.py
+```
 
-两次日志都使用 PPG 和相同 fixed test split。由于 after 模型同时包含 LA
-和困难谓词残差校准头，该表应命名为“6850 → HPRC calibration”，不能写成
-LA 或残差校准头的独立因果消融。论文表格中的 `tail_aux` 路径只表示历史
-代码/文件名，不再作为方法名称。
-
-### 11.7 当前 TBD 状态速查
-
-| TBD group | Current state |
-|---|---|
-| Environment | 可立即运行 11.2 获取 |
-| SGCls/SGDet PPG rows | 尚无标准 one-shot JSON；运行 11.3 |
-| PredCls existing-checkpoint table | 已由 STAR paper、6850、HPRC+PPG、HPRC+RSGP 回填；无需新训练 |
-| RSGP component rows | 尚未生成 `outputs/paper_ablation_rsgp/*` |
-| HPRC per-predicate before/after | 已由 6850 PPG 与 HPRC+PPG 日志回填 |
+无需再做 PredCls 新训练、SGCls/SGDet 新训练、RSGP 新 grid、多 seed、效率/
+显存或新的 component sweep。案例渲染已由
+`scripts/research/export_paper_qualitative_cases.sh` 固化；剩余工作仅为从生成结果中完成论文
+图片排版，不再需要为案例选择重训模型。
 
 ---
 
-## 12. Result provenance
+## 7. 论文图表建议
 
-### Paper baseline
+1. **Method overview**：Semantic Filter → multi-source RSGP → constrained
+   candidate graph → dual-view RCA → prototype classifier + LA；
+2. **Dual-view relation graph**：同一实体作为 subject 与 object 时分别进入
+   \(A_s\) 和 \(A_o\)，并对比 unified graph 的混合；
+3. **Candidate graph comparison**：优先用 test image `440` 展示同一图像上的
+   PPG/PPN/RSGP，附
+   GT-pair coverage、degree Gini、maximum degree、label-pair entropy 和
+   downstream triplet recall；
+4. **Success/failure cases**：image `440/748` 展示 PPG/RSGP 均执行
+   top-10,000 过滤后产生的最终正确 triplet 改善，image `235` 用相同空间节点
+   布局及状态编码边展示被 semantic-capacity 重分配移除的具体正确 triplet；
+   不得用 candidate coverage 线条替代模型预测。SGDet 另行区分 missing box、
+   missing pair 和 wrong predicate。
 
-- Source PDF: `Star A first-ever dataset and a large-scale benchmark for scene graph generation in large-size satellite imagery.pdf`
-- Main SGG results: Table IV；
-- PPG results: Table V；
-- RPCM iteration/component ablations: Tables VI–VII。
-
-### Current standardized PredCls results
-
-```text
-outputs/star_predcls_obb_tail_aux_eval_ppg/test_metrics.json
-outputs/star_predcls_obb_tail_aux_eval_ppn/test_metrics.json
-outputs/star_predcls_obb_tail_aux_eval_RSGP/test_metrics.json
-```
-
-### Reconstructed RPCM-6850 base
-
-```text
-checkpoint: /home/ubuntu/research/ssd/RPCM/weights/6850_4135.pth
-evaluation: outputs/paper_ablation_predcls/B_dual_rca_6850_ppg/test_metrics.json
-log:        outputs/paper_ablation_predcls/B_dual_rca_6850_ppg/test.log
-historical training log: /home/ubuntu/research/ssd/RPCM/nohup.out
-```
-
-The checkpoint name records the historical R@1500/mR@1500 values at iteration
-17,600 (`0.6850/0.4135`). The current project evaluation is separately reported
-as `0.6812/0.4102`; these should not be silently interchanged.
-
-### Historical RSGP search
-
-```text
-outputs/rsgp_grid/*/test_metrics.json
-```
-
-### Current SGCls/SGDet best-HMR results
-
-```text
-outputs/star_sgcls_obb_train/train.log
-outputs/star_sgcls_obb_train/model_best_HR.pth
-outputs/star_sgdet_obb_train/train.log
-outputs/star_sgdet_obb_train/model_best_HR.pth
-```
+类别 recall 基数差异较大，正文更适合使用按关系组整理的表格；图中只展示少量
+具有代表性的 head/mid/tail 类，完整 per-predicate 表放补充材料。
 
 ---
 
-## 13. Final contribution paragraph template
+## 8. 可直接使用的贡献段落
 
-> 本文面向大幅遥感图像中候选实体对数量庞大、关系上下文角色混叠以及困难谓词长期低召回等问题，提出一种图感知的 OBB 场景图生成方法。首先，RSGP 将 pair proposal 从独立 pair 排序重新表述为受遥感几何和图结构约束的候选图构建问题，在固定计算预算下联合利用 PPG 的精度、PPN 的覆盖率以及 OBB 几何、锚点和拓扑先验。其次，角色感知关系上下文模块分别在 shared-subject 与 shared-object 图上传播信息，避免统一关系邻接造成的跨角色语义混合。最后，HPRC 将弱 logit-adjust 辅助监督与零初始化残差校准头结合，在保留主 CE 分类器稳定性的同时修正系统性低召回谓词。STAR OBB 上的 PredCls、SGCls 和 SGDet 实验表明，该方法能够同时提高 R、mR 和 HMR；同一 checkpoint 上的 filter 消融验证了 RSGP 的直接贡献，而 6850 到 HPRC 模型的回溯比较表明困难谓词残差校准能够提高类别均衡召回率。
+> 本文面向大幅遥感图像中候选实体对数量庞大、关系端点角色混叠和谓词分布不均衡
+> 等问题，提出一种图感知的 OBB 场景图生成框架。首先，角色感知 dual-view RCA
+> 分别在 shared-subject 与 shared-object 关系图上传播信息，避免统一邻接造成的
+> 跨角色语义混合。其次，在主 prototype CE 之外引入小权重 logit-adjust
+> auxiliary supervision，在不改变推理分类头的情况下加入类别先验。最后，RSGP
+> 将 pair proposal 重新表述为固定预算下的最大权重有向子图构建，融合 PPG、PPN、
+> OBB 几何以及从训练集自动统计的区域承载、方向排列和关系连通软角色，并通过
+> degree 与 semantic-type capacity 约束候选图。STAR OBB 上的受控 PredCls
+> 消融用于分别验证 RCA 更新、角色分解、LA 和 RSGP，SGCls/SGDet 的同 checkpoint
+> 对比进一步验证其在不同任务设置下的适用性。

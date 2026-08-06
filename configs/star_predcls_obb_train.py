@@ -158,7 +158,7 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_TOPK"] = _env_int("RSGP_TOPK", 10000)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_CHUNK_SIZE"] = _env_int("RSGP_CHUNK_SIZE", 200000)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_PPG_PROTECTED_TOPK"] = _env_int(
     "RSGP_PPG_PROTECTED_TOPK",
-    7000,
+    9000,
 )
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_PPN_POOL_TOPK"] = _env_int("RSGP_PPN_POOL_TOPK", 12000)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_RS_POOL_TOPK"] = _env_int("RSGP_RS_POOL_TOPK", 12000)
@@ -177,11 +177,63 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_ANCHOR"] = _env_float("RSGP_W_ANCHOR",
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_TOPO"] = _env_float("RSGP_W_TOPO", 0.20)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_TAIL"] = _env_float("RSGP_W_TAIL", 0.15)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_DEGREE"] = _env_float("RSGP_W_DEGREE", 0.15)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ROLE_MODE"] = os.environ.get(
+    "RSGP_ROLE_MODE",
+    "statistical",
+).strip().lower()
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_STRUCTURAL_PRIOR_PATH"] = os.environ.get(
+    "RSGP_STRUCTURAL_PRIOR_PATH",
+    "pretrained/rsgp_structural_prior.json",
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_STRUCTURAL_PRIOR_HASH"] = os.environ.get(
+    "RSGP_STRUCTURAL_PRIOR_HASH",
+    "",
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_CONTEXT_CARRIER_MIN"] = _env_int(
+    "RSGP_CONTEXT_CARRIER_MIN",
+    16,
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_CONTEXT_CARRIER_MAX"] = _env_int(
+    "RSGP_CONTEXT_CARRIER_MAX",
+    128,
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_CONTEXT_CARRIER_SCALE"] = _env_float(
+    "RSGP_CONTEXT_CARRIER_SCALE",
+    2.0,
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_CONTEXT"] = _env_float(
+    "RSGP_W_CONTEXT",
+    0.25,
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_ALIGNMENT"] = _env_float(
+    "RSGP_W_ALIGNMENT",
+    0.10,
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_CONNECTIVITY"] = _env_float(
+    "RSGP_W_CONNECTIVITY",
+    0.10,
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_RARITY"] = _env_float(
+    "RSGP_W_RARITY",
+    0.15,
+)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_PPN_COMPLETION"] = _env_bool(
     "RSGP_USE_PPN_COMPLETION", True
 )
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_GEOMETRY"] = _env_bool(
     "RSGP_USE_GEOMETRY", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_CONTEXT_ROLE"] = _env_bool(
+    "RSGP_USE_CONTEXT_ROLE", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_ALIGNMENT_ROLE"] = _env_bool(
+    "RSGP_USE_ALIGNMENT_ROLE", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_CONNECTIVITY_ROLE"] = _env_bool(
+    "RSGP_USE_CONNECTIVITY_ROLE", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_RARITY_PRIOR"] = _env_bool(
+    "RSGP_USE_RARITY_PRIOR", True
 )
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_ANCHOR"] = _env_bool(
     "RSGP_USE_ANCHOR", True
@@ -244,6 +296,15 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_REL_SUBJ_VIEW_ENABLED"] = _env_bool(
 )
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_REL_OBJ_VIEW_ENABLED"] = _env_bool(
     "RPCM_REL_OBJ_VIEW_ENABLED", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_ROLE_AWARE_MAX_LOG_WEIGHT"] = float(
+    os.environ.get("RPCM_ROLE_AWARE_MAX_LOG_WEIGHT", "1.0")
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_ROLE_AWARE_RESIDUAL_MAX_WEIGHT"] = float(
+    os.environ.get("RPCM_ROLE_AWARE_RESIDUAL_MAX_WEIGHT", "0.25")
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_ROLE_AWARE_ADAPTER_RANK"] = int(
+    os.environ.get("RPCM_ROLE_AWARE_ADAPTER_RANK", "32")
 )
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PREDICT_USE_BIAS"] = False
 cfg["MODEL"]["ROI_RELATION_HEAD"]["BIAS_LAMBDA"] = 0.2
@@ -355,7 +416,7 @@ cfg["SOLVER"]["OUTPUT_DIR"] = os.environ.get("OUTPUT_DIR", "outputs/star_predcls
 cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "4"))
 cfg["SOLVER"]["VAL_PERIOD"] = int(os.environ.get("VAL_PERIOD", "4"))
 cfg["SOLVER"]["VAL_START_PERIOD"] = int(os.environ.get("VAL_START_PERIOD", "245"))
-cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "test")
+cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "val")
 cfg["SOLVER"]["PRINT_GRAD_FREQ"] = 0
 cfg["SOLVER"]["GRAD_NORM_CLIP"] = 5.0
 cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupMultiStepLR"
@@ -402,6 +463,7 @@ cfg["SOLVER"]["SCHEDULE"]["EXP_GAMMA"] = 0.9999
 # The STAR paper protocol reports R/mR/HMR@1000/1500/2000.
 # ---------------------------------------------------------------------------
 cfg["TEST"]["RECALL_AT"] = [1000, 1500, 2000]
+cfg["TEST"]["PROFILE_INFERENCE"] = _env_bool("PROFILE_INFERENCE", False)
 cfg["TEST"]["EVAL_DEBUG"] = {
     "ENABLED": True,
     "TOP_PREDICATES": 10,

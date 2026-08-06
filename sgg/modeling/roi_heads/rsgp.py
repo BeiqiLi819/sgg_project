@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from pathlib import Path
 from typing import Dict, Iterable, Sequence
@@ -9,6 +10,7 @@ from typing import Dict, Iterable, Sequence
 import torch
 from torch import nn
 
+from sgg.data.rsgp_statistics import load_rsgp_structural_prior
 from sgg.modeling.core.obb_ops import angle_to_radians, get_boxlist_angle_unit
 from sgg.modeling.roi_heads.pair_proposal_network import PairProposalNetworkFilter
 from sgg.modeling.roi_heads.ppg import PairProposalGenerator
@@ -82,7 +84,7 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         self.threshold = _as_int(rel_cfg, "RSGP_THRESHOLD", _as_int(rel_cfg, "PPG_PAIR_THRESHOLD", 10000))
         self.topk = _as_int(rel_cfg, "RSGP_TOPK", int(rel_cfg.get("TEST_FILTER_TOPK", 10000)))
         self.chunk_size = max(1, _as_int(rel_cfg, "RSGP_CHUNK_SIZE", 200000))
-        self.ppg_protected_topk = _as_int(rel_cfg, "RSGP_PPG_PROTECTED_TOPK", 7000)
+        self.ppg_protected_topk = _as_int(rel_cfg, "RSGP_PPG_PROTECTED_TOPK", 9000)
         self.ppn_pool_topk = _as_int(rel_cfg, "RSGP_PPN_POOL_TOPK", 12000)
         self.rs_pool_topk = _as_int(rel_cfg, "RSGP_RS_POOL_TOPK", 12000)
         self.max_out_degree = _as_int(rel_cfg, "RSGP_MAX_OUT_DEGREE", 96)
@@ -108,6 +110,100 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         self.enforce_label_quota = _as_bool(rel_cfg, "RSGP_ENFORCE_LABEL_QUOTA", True)
 
         self.class_names = list(_cfg_get(cfg, "MODEL", "ROI_BOX_HEAD", "CLASS_NAMES", default=[]))
+        self.predicate_names = list(
+            rel_cfg.get("RELATION_NAMES", _cfg_get(cfg, "MODEL", "RELATION_NAMES", default=[]))
+        )
+        self.role_mode = str(rel_cfg.get("RSGP_ROLE_MODE", "statistical")).strip().lower()
+        if self.role_mode not in {"statistical", "legacy_manual"}:
+            raise ValueError(
+                "RSGP_ROLE_MODE must be 'statistical' or 'legacy_manual', "
+                f"got {self.role_mode!r}."
+            )
+        self.use_context_role = _as_bool(
+            rel_cfg,
+            "RSGP_USE_CONTEXT_ROLE",
+            _as_bool(rel_cfg, "RSGP_USE_ANCHOR", True),
+        )
+        self.use_alignment_role = _as_bool(
+            rel_cfg,
+            "RSGP_USE_ALIGNMENT_ROLE",
+            _as_bool(rel_cfg, "RSGP_USE_TOPOLOGY", True),
+        )
+        self.use_connectivity_role = _as_bool(
+            rel_cfg,
+            "RSGP_USE_CONNECTIVITY_ROLE",
+            _as_bool(rel_cfg, "RSGP_USE_TOPOLOGY", True),
+        )
+        self.use_rarity_prior = _as_bool(
+            rel_cfg,
+            "RSGP_USE_RARITY_PRIOR",
+            _as_bool(rel_cfg, "RSGP_USE_TAIL_PRIOR", True),
+        )
+        self.context_carrier_min = max(1, _as_int(rel_cfg, "RSGP_CONTEXT_CARRIER_MIN", 16))
+        self.context_carrier_max = max(
+            self.context_carrier_min,
+            _as_int(rel_cfg, "RSGP_CONTEXT_CARRIER_MAX", 128),
+        )
+        self.context_carrier_scale = max(
+            0.0,
+            _as_float(rel_cfg, "RSGP_CONTEXT_CARRIER_SCALE", 2.0),
+        )
+        self.w_context = _as_float(rel_cfg, "RSGP_W_CONTEXT", 0.25)
+        self.w_alignment = _as_float(rel_cfg, "RSGP_W_ALIGNMENT", 0.10)
+        self.w_connectivity = _as_float(rel_cfg, "RSGP_W_CONNECTIVITY", 0.10)
+        self.w_rarity = _as_float(rel_cfg, "RSGP_W_RARITY", 0.15)
+
+        self.anchor_class_ids: tuple[int, ...] = ()
+        self.vehicle_class_ids: tuple[int, ...] = ()
+        self.network_class_ids: tuple[int, ...] = ()
+        self.tail_predicates: tuple[int, ...] = ()
+        self.register_buffer("tail_pair_support", torch.zeros((0, 0), dtype=torch.bool), persistent=False)
+        self.register_buffer(
+            "class_context_profile",
+            torch.zeros((0,), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "class_alignment_profile",
+            torch.zeros((0,), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "class_connectivity_profile",
+            torch.zeros((0,), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "rarity_pair_support",
+            torch.zeros((0, 0), dtype=torch.float32),
+            persistent=False,
+        )
+        self.structural_prior_hash = ""
+        if self.role_mode == "statistical":
+            self._load_structural_prior(rel_cfg)
+        else:
+            self._initialize_legacy_manual_roles(rel_cfg)
+
+        self.ppg = self._make_ppg(cfg) if self.mode in {"HYBRID"} else None
+        self.ppn = (
+            self._make_ppn(cfg)
+            if self.use_ppn_completion and self.mode in {"HYBRID", "PPN_GRAPH"}
+            else None
+        )
+        print(
+            "[RSGP] "
+            f"mode={self.mode}, topk={self.topk}, ppg_protected={self.ppg_protected_topk}, "
+            f"ppn_pool={self.ppn_pool_topk}, rs_pool={self.rs_pool_topk}, "
+            f"degree={self.max_out_degree}/{self.max_in_degree}, "
+            f"components=ppn:{self.use_ppn_completion},geom:{self.use_geometry},"
+            f"context:{self.use_context_role},alignment:{self.use_alignment_role},"
+            f"connectivity:{self.use_connectivity_role},rarity:{self.use_rarity_prior},"
+            f"degree_cap:{self.enforce_degree_cap},quota:{self.enforce_label_quota}, "
+            f"role_mode={self.role_mode}, prior_hash={self.structural_prior_hash or '<legacy>'}",
+            flush=True,
+        )
+
+    def _initialize_legacy_manual_roles(self, rel_cfg: dict) -> None:
         self.anchor_class_ids = self._find_class_ids(
             rel_cfg.get(
                 "RSGP_ANCHOR_CLASSES",
@@ -127,32 +223,50 @@ class RemoteSensingGraphProposalFilter(nn.Module):
             )
         )
         self.tail_predicates = tuple(
-            int(v) for v in rel_cfg.get(
+            int(v)
+            for v in rel_cfg.get(
                 "RSGP_TAIL_PREDICATES",
                 (7, 14, 20, 24, 25, 28, 31, 33, 36, 38, 39, 41, 53, 56, 58),
             )
         )
-        self.register_buffer("tail_pair_support", torch.zeros((0, 0), dtype=torch.bool), persistent=False)
         self._load_tail_support(rel_cfg)
 
-        self.ppg = self._make_ppg(cfg) if self.mode in {"HYBRID"} else None
-        self.ppn = (
-            self._make_ppn(cfg)
-            if self.use_ppn_completion and self.mode in {"HYBRID", "PPN_GRAPH"}
-            else None
+    def _load_structural_prior(self, rel_cfg: dict) -> None:
+        if not self.class_names or not self.predicate_names:
+            raise RuntimeError(
+                "Statistical RSGP requires resolved class and predicate metadata before "
+                "the relation head is constructed."
+            )
+        path = str(
+            rel_cfg.get(
+                "RSGP_STRUCTURAL_PRIOR_PATH",
+                "pretrained/rsgp_structural_prior.json",
+            )
         )
-        print(
-            "[RSGP] "
-            f"mode={self.mode}, topk={self.topk}, ppg_protected={self.ppg_protected_topk}, "
-            f"ppn_pool={self.ppn_pool_topk}, rs_pool={self.rs_pool_topk}, "
-            f"degree={self.max_out_degree}/{self.max_in_degree}, "
-            f"components=ppn:{self.use_ppn_completion},geom:{self.use_geometry},"
-            f"anchor:{self.use_anchor},topo:{self.use_topology},tail:{self.use_tail_prior},"
-            f"degree_cap:{self.enforce_degree_cap},quota:{self.enforce_label_quota}, "
-            f"anchors={len(self.anchor_class_ids)}, vehicles={len(self.vehicle_class_ids)}, "
-            f"networks={len(self.network_class_ids)}",
-            flush=True,
+        payload = load_rsgp_structural_prior(
+            path,
+            class_names=self.class_names,
+            predicate_names=self.predicate_names,
+            expected_hash=str(rel_cfg.get("RSGP_STRUCTURAL_PRIOR_HASH", "")),
         )
+        profiles = payload["class_profiles"]
+        self.class_context_profile = torch.tensor(
+            profiles["contextual_region"],
+            dtype=torch.float32,
+        )
+        self.class_alignment_profile = torch.tensor(
+            profiles["directional_alignment"],
+            dtype=torch.float32,
+        )
+        self.class_connectivity_profile = torch.tensor(
+            profiles["relational_connectivity"],
+            dtype=torch.float32,
+        )
+        self.rarity_pair_support = torch.tensor(
+            payload["rarity_pair_support"],
+            dtype=torch.float32,
+        )
+        self.structural_prior_hash = str(payload["payload_hash"])
 
     def _find_class_ids(self, names: str | Sequence[str]) -> tuple[int, ...]:
         if not self.class_names:
@@ -212,6 +326,8 @@ class RemoteSensingGraphProposalFilter(nn.Module):
             self._add_stage_fields(proposal, pair_idx, pair_idx, pair_idx)
             return pair_idx
 
+        if self.role_mode == "statistical":
+            self._prepare_statistical_roles(proposal, pair_idx)
         ppg_pairs = self._ppg_pairs(proposal, pair_idx)
         ppn_pairs, ppn_scores = self._ppn_pairs_and_scores(proposal, pair_idx)
         rs_pairs, _ = self._topk_by_rs_score(proposal, pair_idx, self.rs_pool_topk)
@@ -261,6 +377,8 @@ class RemoteSensingGraphProposalFilter(nn.Module):
                 "selected": int(selected.size(0)),
                 "topk": int(self.topk),
                 "mode": self.mode,
+                "role_mode": self.role_mode,
+                "structural_prior_hash": self.structural_prior_hash,
             },
         )
 
@@ -324,9 +442,6 @@ class RemoteSensingGraphProposalFilter(nn.Module):
     ) -> torch.Tensor:
         parts = self._rs_scores_for_pairs(proposal, candidate_pairs)
         geom = _zscore(parts["geom"])
-        anchor = _zscore(parts["anchor"], parts["anchor"].ne(0))
-        topo = _zscore(parts["topo"], parts["topo"].ne(0))
-        tail = parts["tail"]
         degree = (
             _zscore(self._degree_balance_scores(proposal, candidate_pairs))
             if self.use_degree_score
@@ -336,6 +451,25 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         ppn = self._source_score(candidate_pairs, ppn_pairs, ppn_pair_scores)
         ppg = _zscore(ppg, ppg.ne(0))
         ppn = _zscore(ppn, ppn.ne(0))
+        if self.role_mode == "statistical":
+            context = _zscore(parts["context"], parts["context"].ne(0))
+            alignment = _zscore(parts["alignment"], parts["alignment"].ne(0))
+            connectivity = _zscore(parts["connectivity"], parts["connectivity"].ne(0))
+            rarity = parts["rarity"]
+            return (
+                self.w_ppg * ppg
+                + self.w_ppn * ppn
+                + self.w_geom * geom
+                + self.w_context * context
+                + self.w_alignment * alignment
+                + self.w_connectivity * connectivity
+                + self.w_rarity * rarity
+                + self.w_degree * degree
+            )
+
+        anchor = _zscore(parts["anchor"], parts["anchor"].ne(0))
+        topo = _zscore(parts["topo"], parts["topo"].ne(0))
+        tail = parts["tail"]
         return (
             self.w_ppg * ppg
             + self.w_ppn * ppn
@@ -358,11 +492,240 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         # relation graph, where very high-degree nodes create noisy rel-rel maps.
         return -torch.log1p(out_counts[h] + in_counts[t])
 
+    def _prepare_statistical_roles(
+        self,
+        proposal: BoxList,
+        semantic_pairs: torch.Tensor,
+    ) -> None:
+        num_entities = len(proposal)
+        device = proposal.bbox.device
+        if num_entities == 0:
+            empty = proposal.bbox.new_zeros((0,))
+            proposal.add_field("rsgp_context_role", empty)
+            proposal.add_field("rsgp_alignment_role", empty)
+            proposal.add_field("rsgp_connectivity_role", empty)
+            proposal.add_field("rsgp_context_assignment", empty.long())
+            proposal.add_field("rsgp_context_confidence", empty)
+            proposal.add_field("rsgp_context_carrier_mask", empty.bool())
+            return
+
+        labels = proposal.get_field("labels").long().to(device)
+        num_profile_classes = int(self.class_context_profile.numel())
+        if labels.numel() and (
+            int(labels.min()) < 0 or int(labels.max()) >= num_profile_classes
+        ):
+            raise RuntimeError(
+                "RSGP proposal label is outside the structural-prior class range: "
+                f"valid=[0,{num_profile_classes - 1}], "
+                f"actual=[{int(labels.min())},{int(labels.max())}]."
+            )
+        context_prior = self.class_context_profile.to(device)[labels]
+        alignment_prior = self.class_alignment_profile.to(device)[labels]
+        connectivity_prior = self.class_connectivity_profile.to(device)[labels]
+        centers, sizes, angles = self._box_state(proposal)
+        centers, sizes, angles = centers.to(device), sizes.to(device), angles.to(device)
+
+        areas = sizes.prod(dim=1)
+        order = areas.argsort(stable=True)
+        area_rank = areas.new_empty((num_entities,))
+        area_rank[order] = (
+            torch.arange(num_entities, device=device, dtype=areas.dtype) + 0.5
+        ) / max(num_entities, 1)
+        elongation = 1.0 - (
+            sizes.min(dim=1).values / sizes.max(dim=1).values.clamp(min=1e-6)
+        )
+
+        if semantic_pairs.numel() > 0:
+            heads = semantic_pairs[:, 0].long()
+            tails = semantic_pairs[:, 1].long()
+            semantic_degree = (
+                torch.bincount(heads, minlength=num_entities)
+                + torch.bincount(tails, minlength=num_entities)
+            ).float()
+            semantic_degree = torch.log1p(semantic_degree) / max(
+                math.log1p(max(2 * (num_entities - 1), 1)),
+                1e-6,
+            )
+        else:
+            semantic_degree = areas.new_zeros((num_entities,))
+
+        preliminary_context = 0.5 * (context_prior + area_rank)
+        carrier_count = min(
+            num_entities,
+            self.context_carrier_max,
+            max(
+                self.context_carrier_min,
+                int(math.ceil(self.context_carrier_scale * math.sqrt(num_entities))),
+            ),
+        )
+        carrier_indices = preliminary_context.topk(carrier_count).indices
+        carrier_centers = centers[carrier_indices]
+        carrier_sizes = sizes[carrier_indices].clamp(min=1e-6)
+        carrier_angles = angles[carrier_indices]
+
+        delta = centers.unsqueeze(0) - carrier_centers.unsqueeze(1)
+        cos = carrier_angles.cos().unsqueeze(1)
+        sin = carrier_angles.sin().unsqueeze(1)
+        local_x = delta[:, :, 0] * cos + delta[:, :, 1] * sin
+        local_y = -delta[:, :, 0] * sin + delta[:, :, 1] * cos
+        inside = (
+            (local_x.abs() <= carrier_sizes[:, None, 0] * 0.5)
+            & (local_y.abs() <= carrier_sizes[:, None, 1] * 0.5)
+        )
+        carrier_rows = torch.arange(carrier_count, device=device)
+        inside[carrier_rows, carrier_indices] = False
+        containment = inside.float().sum(dim=1) / max(num_entities - 1, 1)
+        carrier_instance_context = 0.5 * (
+            area_rank[carrier_indices] + containment
+        )
+        carrier_role = 0.5 * (
+            context_prior[carrier_indices] + carrier_instance_context
+        )
+        context_role = preliminary_context.clone()
+        context_role[carrier_indices] = carrier_role
+
+        distances = torch.cdist(centers, carrier_centers)
+        carrier_diag = carrier_sizes.square().sum(dim=1).sqrt().clamp(min=1e-6)
+        proximity = torch.exp(
+            -(distances / carrier_diag.unsqueeze(0)).clamp(max=20)
+        )
+        affinity = torch.maximum(proximity, inside.transpose(0, 1).float())
+        affinity = affinity * carrier_role.unsqueeze(0)
+        context_confidence, context_assignment = affinity.max(dim=1)
+        carrier_mask = torch.zeros((num_entities,), dtype=torch.bool, device=device)
+        carrier_mask[carrier_indices] = True
+
+        alignment_role = 0.5 * (alignment_prior + elongation)
+        connectivity_role = 0.5 * (connectivity_prior + semantic_degree)
+        proposal.add_field("rsgp_context_role", context_role.clamp(0, 1).detach())
+        proposal.add_field("rsgp_alignment_role", alignment_role.clamp(0, 1).detach())
+        proposal.add_field(
+            "rsgp_connectivity_role",
+            connectivity_role.clamp(0, 1).detach(),
+        )
+        proposal.add_field("rsgp_context_assignment", context_assignment.detach())
+        proposal.add_field("rsgp_context_confidence", context_confidence.detach())
+        proposal.add_field("rsgp_context_carrier_mask", carrier_mask.detach())
+
+    def _statistical_role_scores(
+        self,
+        proposal: BoxList,
+        labels: torch.Tensor,
+        centers: torch.Tensor,
+        sizes: torch.Tensor,
+        angles: torch.Tensor,
+        pairs: torch.Tensor,
+        dist_norm: torch.Tensor,
+        delta: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        h, t = pairs[:, 0].long(), pairs[:, 1].long()
+        zero = centers.new_zeros((pairs.size(0),))
+        if not proposal.has_field("rsgp_alignment_role"):
+            self._prepare_statistical_roles(proposal, pairs)
+
+        if self.use_context_role:
+            assignment = proposal.get_field("rsgp_context_assignment").to(pairs.device)
+            confidence = proposal.get_field("rsgp_context_confidence").to(pairs.device)
+            carrier_mask = proposal.get_field("rsgp_context_carrier_mask").to(pairs.device)
+            same_context = (assignment[h] == assignment[t]).float() * confidence[h] * confidence[t]
+            different_context = (
+                (assignment[h] != assignment[t]).float()
+                * confidence[h]
+                * confidence[t]
+                * 0.6
+            )
+            endpoint_context = (
+                (carrier_mask[h] | carrier_mask[t]).float()
+                * torch.maximum(confidence[h], confidence[t])
+                * 0.4
+            )
+            context = torch.maximum(
+                torch.maximum(same_context, different_context),
+                endpoint_context,
+            )
+        else:
+            context = zero
+
+        if self.use_alignment_role:
+            alignment_role = proposal.get_field("rsgp_alignment_role").to(pairs.device)
+            alignment_gate = torch.sqrt(
+                (alignment_role[h] * alignment_role[t]).clamp(min=0)
+            )
+            angle_diff = torch.atan2(
+                torch.sin(angles[h] - angles[t]),
+                torch.cos(angles[h] - angles[t]),
+            ).abs()
+            parallel = torch.cos(angle_diff).abs()
+            direction = torch.stack((torch.cos(angles[h]), torch.sin(angles[h])), dim=1)
+            along = (delta * direction).sum(dim=1).abs()
+            lateral = (
+                delta[:, 0] * direction[:, 1] - delta[:, 1] * direction[:, 0]
+            ).abs()
+            lateral_score = torch.exp(
+                -(lateral / sizes[h].mean(dim=1).clamp(min=1e-6)).clamp(max=20)
+            )
+            along_score = torch.exp(
+                -(along / sizes[h].square().sum(1).sqrt().clamp(min=1e-6)).clamp(max=20)
+                * 0.25
+            )
+            alignment = alignment_gate * (
+                0.55 * parallel + 0.30 * lateral_score + 0.15 * along_score
+            )
+        else:
+            alignment = zero
+
+        if self.use_connectivity_role:
+            connectivity_role = proposal.get_field("rsgp_connectivity_role").to(pairs.device)
+            connectivity_gate = torch.sqrt(
+                (connectivity_role[h] * connectivity_role[t]).clamp(min=0)
+            )
+            connectivity = connectivity_gate * torch.exp(
+                -0.5 * dist_norm.clamp(max=20)
+            )
+        else:
+            connectivity = zero
+
+        if self.use_rarity_prior and self.rarity_pair_support.numel() > 0:
+            support = self.rarity_pair_support.to(pairs.device)
+            if labels.numel() and (
+                int(labels.min()) < 0
+                or int(labels.max()) >= min(support.size(0), support.size(1))
+            ):
+                raise RuntimeError(
+                    "RSGP proposal label is outside the rarity-support class range."
+                )
+            subj_labels = labels[h].long()
+            obj_labels = labels[t].long()
+            rarity = support[subj_labels, obj_labels]
+        else:
+            rarity = zero
+        return {
+            "context": context,
+            "alignment": alignment,
+            "connectivity": connectivity,
+            "rarity": rarity,
+        }
+
     def _rs_scores_for_pairs(self, proposal: BoxList, pairs: torch.Tensor) -> Dict[str, torch.Tensor]:
         device = pairs.device
         if pairs.numel() == 0:
             empty = proposal.bbox.new_zeros((0,))
-            return {"geom": empty, "anchor": empty, "topo": empty, "tail": empty, "rs_total": empty}
+            if self.role_mode == "statistical":
+                return {
+                    "geom": empty,
+                    "context": empty,
+                    "alignment": empty,
+                    "connectivity": empty,
+                    "rarity": empty,
+                    "rs_total": empty,
+                }
+            return {
+                "geom": empty,
+                "anchor": empty,
+                "topo": empty,
+                "tail": empty,
+                "rs_total": empty,
+            }
         labels = proposal.get_field("labels").long().to(device)
         centers, sizes, angles = self._box_state(proposal)
         centers, sizes, angles = centers.to(device), sizes.to(device), angles.to(device)
@@ -391,6 +754,26 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         geom = 0.35 * iou + 0.30 * close + 0.20 * compact + 0.15 * parallel
         if not self.use_geometry:
             geom = geom.zero_()
+
+        if self.role_mode == "statistical":
+            roles = self._statistical_role_scores(
+                proposal,
+                labels,
+                centers,
+                sizes,
+                angles,
+                pairs,
+                dist_norm,
+                delta,
+            )
+            rs_total = (
+                geom
+                + 0.7 * roles["context"]
+                + 0.3 * roles["alignment"]
+                + 0.3 * roles["connectivity"]
+                + 0.35 * roles["rarity"]
+            )
+            return {"geom": geom, **roles, "rs_total": rs_total}
 
         anchor = (
             self._anchor_scores(labels, centers, sizes, pairs)

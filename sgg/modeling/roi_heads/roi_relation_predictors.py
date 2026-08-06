@@ -27,6 +27,146 @@ def _cfg_get(cfg: dict, *keys, default=None):
         cur = cur[key]
     return cur
 
+
+def _matrix_squared_euclidean_distance(
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> torch.Tensor:
+    """Compute all squared Euclidean distances without a 3-D broadcast.
+
+    This is algebraically equivalent to the source RPCM
+    ``subtract -> norm -> square`` expression while retaining only
+    ``[num_left, num_right]`` intermediates. Round-off can make distances
+    between nearly identical vectors slightly negative, so only those invalid
+    values are clamped to zero. Loss weights and hard-negative mining remain
+    unchanged.
+    """
+
+    left_sq = left.square().sum(dim=1, keepdim=True)
+    right_sq = right.square().sum(dim=1).unsqueeze(0)
+    distances = left_sq + right_sq - 2.0 * (left @ right.t())
+    return distances.clamp_min(0.0)
+
+
+def _endpoint_group_message(
+    features: torch.Tensor,
+    source_endpoint: torch.Tensor,
+    target_endpoint: torch.Tensor,
+    num_entities: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Average source-relation features for one directed endpoint role.
+
+    ``source_endpoint[f]`` selects the entity used to group source relation
+    ``f`` and ``target_endpoint[e]`` selects the group read by target relation
+    ``e``.  The diagonal relation-to-itself contribution is removed, matching
+    the dense RPCM relation adjacency before its GCN adds a self loop.
+
+    This is the sparse-incidence equivalent of an ``E x E`` endpoint equality
+    matrix, but it needs only ``O((N + E)D)`` working memory.
+    """
+
+    num_relations = int(features.size(0))
+    if num_relations == 0:
+        return features, features.new_zeros((0, 1))
+
+    source_endpoint = source_endpoint.to(device=features.device, dtype=torch.long)
+    target_endpoint = target_endpoint.to(device=features.device, dtype=torch.long)
+    group_sum = features.new_zeros((int(num_entities), features.size(1)))
+    group_sum.index_add_(0, source_endpoint, features)
+    group_count = torch.bincount(
+        source_endpoint,
+        minlength=int(num_entities),
+    ).to(device=features.device, dtype=features.dtype)
+
+    message = group_sum.index_select(0, target_endpoint)
+    count = group_count.index_select(0, target_endpoint).unsqueeze(1)
+    self_matches = (source_endpoint == target_endpoint).to(features.dtype).unsqueeze(1)
+    message = message - self_matches * features
+    count = count - self_matches
+    valid = count > 0
+    message = message / count.clamp_min(1.0)
+    return message * valid.to(features.dtype), valid
+
+
+def _role_aware_relation_message(
+    features: torch.Tensor,
+    subject_endpoint: torch.Tensor,
+    object_endpoint: torch.Tensor,
+    num_entities: int,
+    type_logits: torch.Tensor,
+    max_log_weight: float,
+    source_transforms: Sequence[nn.Module] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse SS, OO and both directed cross-role chain messages.
+
+    The view order is ``SS, OO, OS, SO`` where matrix rows denote target
+    relations and columns denote source relations.  Thus OS represents
+    ``object(target) == subject(source)`` and SO represents its reverse role.
+    Positive bounded weights keep every view active and are normalized over
+    the views that have at least one neighbor for each relation.
+    """
+
+    if type_logits.numel() != 4:
+        raise ValueError(
+            "role-aware relation graph requires four type logits in "
+            "SS/OO/OS/SO order"
+        )
+    if source_transforms is not None and len(source_transforms) != 4:
+        raise ValueError(
+            "role-aware relation graph requires four source transforms in "
+            "SS/OO/OS/SO order"
+        )
+    weights = torch.exp(float(max_log_weight) * torch.tanh(type_logits)).to(
+        device=features.device,
+        dtype=features.dtype,
+    )
+    endpoint_views = (
+        (subject_endpoint, subject_endpoint),  # SS
+        (object_endpoint, object_endpoint),  # OO
+        (subject_endpoint, object_endpoint),  # OS: O(target) == S(source)
+        (object_endpoint, subject_endpoint),  # SO: S(target) == O(source)
+    )
+    fused = torch.zeros_like(features)
+    denominator = features.new_zeros((features.size(0), 1))
+    for view_idx, (weight, (source_endpoint, target_endpoint)) in enumerate(
+        zip(weights, endpoint_views)
+    ):
+        source_features = (
+            features
+            if source_transforms is None
+            else source_transforms[view_idx](features)
+        )
+        message, valid = _endpoint_group_message(
+            source_features,
+            source_endpoint,
+            target_endpoint,
+            num_entities,
+        )
+        fused = fused + weight * message
+        denominator = denominator + weight * valid.to(features.dtype)
+    return fused / denominator.clamp_min(1e-7), weights
+
+
+class _RoleAwareLowRankAdapter(nn.Module):
+    """Zero-output low-rank role adapter without consuming global RNG state."""
+
+    def __init__(self, dim: int, rank: int, seed: int):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"role-aware adapter rank must be positive, got {rank}")
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        down = torch.empty((int(rank), int(dim)), dtype=torch.float32)
+        down.normal_(mean=0.0, std=1.0 / math.sqrt(float(dim)), generator=generator)
+        self.down_weight = nn.Parameter(down)
+        self.up_weight = nn.Parameter(
+            torch.zeros((int(dim), int(rank)), dtype=torch.float32)
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        low_rank = F.linear(features, self.down_weight)
+        return F.linear(low_rank, self.up_weight)
+
 _DEFAULT_REL_ANTONYM_NAME_PAIRS = [
     ("parallelly docked at", "isolatedly docked at"),
     ("docking at the same dock with", "docking at the different dock with"),
@@ -875,8 +1015,13 @@ class _OriginalRPCMPairwiseFeatureExtractor(nn.Module):
             semantic_glove_path = str(
                 _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "SEMANTIC_GLOVE_PATH", default="")
             )
-            if self.glove_init_mode == "rpcm":
-                obj_embed_vecs, self.obj_glove_diagnostics = _build_rpcm_object_glove_init(
+            if self.glove_init_mode in {"rpcm", "sgg_toolkit"}:
+                glove_builder = (
+                    _build_sgg_toolkit_object_glove_init
+                    if self.glove_init_mode == "sgg_toolkit"
+                    else _build_rpcm_object_glove_init
+                )
+                obj_embed_vecs, self.obj_glove_diagnostics = glove_builder(
                     self.obj_classes[: self.num_obj_classes],
                     semantic_glove_path,
                     self.embed_dim,
@@ -1598,6 +1743,99 @@ def _build_rpcm_object_glove_init(
             missing_classes.append(name)
     return vectors, {
         "missing_classes": missing_classes,
+        "missing_tokens": sorted(set(missing_tokens)),
+    }
+
+
+def _build_sgg_toolkit_object_glove_init(
+    names: Sequence[str],
+    glove_path: str,
+    embed_dim: int,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Reproduce SGG-ToolKit ``obj_edge_vectors`` literally.
+
+    In particular, the source code does *not* split STAR's underscore-delimited
+    class names.  It first looks up the complete class string and then falls
+    back to the longest whitespace-delimited token.  Rows that still miss
+    retain their initial ``N(0, 1)`` value, including the background row when
+    its literal name is absent from GloVe.
+    """
+
+    table = _load_rpcm_glove_table(glove_path, embed_dim)
+    vectors = torch.empty((len(names), embed_dim), dtype=torch.float32)
+    vectors.normal_(0.0, 1.0)
+    if table is None:
+        return vectors, {"missing_classes": list(map(str, names))}
+
+    word_to_idx, glove_vectors = table
+    missing_classes: list[str] = []
+    fallback_tokens: dict[str, str] = {}
+    for idx, raw_name in enumerate(names):
+        name = str(raw_name)
+        word_idx = word_to_idx.get(name)
+        if word_idx is not None:
+            vectors[idx] = glove_vectors[word_idx]
+            continue
+        tokens = name.split(" ")
+        longest = sorted(tokens, key=len, reverse=True)[0] if tokens else name
+        fallback_tokens[name] = longest
+        word_idx = word_to_idx.get(longest)
+        if word_idx is not None:
+            vectors[idx] = glove_vectors[word_idx]
+        else:
+            missing_classes.append(name)
+    return vectors, {
+        "missing_classes": missing_classes,
+        "fallback_tokens": fallback_tokens,
+    }
+
+
+def _build_sgg_toolkit_relation_glove_init(
+    names: Sequence[str],
+    glove_path: str,
+    embed_dim: int,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Reproduce SGG-ToolKit ``rel_vectors`` without dataset imports.
+
+    Predicate row zero remains random.  A foreground phrase is initialized
+    from an exact GloVe hit or the unweighted mean of its available
+    whitespace-delimited token vectors.  No normalization, modifier handling,
+    token aliasing, or underscore splitting is applied.
+    """
+
+    table = _load_rpcm_glove_table(glove_path, embed_dim)
+    vectors = torch.empty((len(names), embed_dim), dtype=torch.float32)
+    vectors.normal_(0.0, 1.0)
+    if table is None:
+        return vectors, {"missing_predicates": list(map(str, names[1:]))}
+
+    word_to_idx, glove_vectors = table
+    missing_predicates: list[str] = []
+    missing_tokens: list[str] = []
+    for idx, raw_name in enumerate(names):
+        if idx == 0:
+            continue
+        name = str(raw_name)
+        word_idx = word_to_idx.get(name)
+        if word_idx is not None:
+            vectors[idx] = glove_vectors[word_idx]
+            continue
+        token_vectors: list[torch.Tensor] = []
+        for token in name.split(" "):
+            token_idx = word_to_idx.get(token)
+            if token_idx is None:
+                missing_tokens.append(f"{name}:{token}")
+            else:
+                token_vectors.append(glove_vectors[token_idx])
+        if token_vectors:
+            vectors[idx] = torch.stack(token_vectors, dim=0).mean(dim=0)
+        else:
+            # The source would divide by zero here.  Retaining the already
+            # sampled row keeps the run finite while making the discrepancy
+            # explicit in diagnostics.
+            missing_predicates.append(name)
+    return vectors, {
+        "missing_predicates": missing_predicates,
         "missing_tokens": sorted(set(missing_tokens)),
     }
 
@@ -2644,10 +2882,15 @@ class RPCMLegacy(nn.Module):
                 default=False,
             )
         )
-        if self.relation_graph_mode not in {"sgg_toolkit", "unified", "dual_view"}:
+        if self.relation_graph_mode not in {
+            "sgg_toolkit",
+            "unified",
+            "dual_view",
+            "role_aware",
+        }:
             raise ValueError(
                 "MODEL.ROI_RELATION_HEAD.RPCM_RELATION_GRAPH_MODE must be "
-                "'sgg_toolkit', 'unified' or 'dual_view', "
+                "'sgg_toolkit', 'unified', 'dual_view' or 'role_aware', "
                 f"got {self.relation_graph_mode!r}"
             )
         self.rel_subj_view_enabled = bool(
@@ -2675,6 +2918,33 @@ class RPCMLegacy(nn.Module):
                 "dual_view RPCM requires at least one of "
                 "RPCM_REL_SUBJ_VIEW_ENABLED/RPCM_REL_OBJ_VIEW_ENABLED"
             )
+        self.role_aware_max_log_weight = float(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_ROLE_AWARE_MAX_LOG_WEIGHT",
+                default=1.0,
+            )
+        )
+        self.role_aware_residual_max_weight = float(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_ROLE_AWARE_RESIDUAL_MAX_WEIGHT",
+                default=0.25,
+            )
+        )
+        self.role_aware_adapter_rank = int(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_ROLE_AWARE_ADAPTER_RANK",
+                default=32,
+            )
+        )
         dropout = float(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_DROPOUT", default=0.2))
         self.predict_use_bias = bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PREDICT_USE_BIAS", default=False))
         self.bias_lambda_train = float(
@@ -2743,6 +3013,29 @@ class RPCMLegacy(nn.Module):
                 self.gcn_ent2ent.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
                 self.gcn_ent2rel.append(_LegacyGraphConvolutionLayerCollect(self.graph_dim, self.graph_dim))
                 self.gcn_rel2rel.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
+            if self.relation_graph_mode == "role_aware":
+                # The unified GCN remains shared. Each endpoint role gets only
+                # a low-rank delta transform; zero up-projections make a new
+                # role-aware model exactly equivalent to unified RPCM while
+                # allowing adapter gradients from the first optimizer step.
+                self.role_aware_type_logits = nn.Parameter(
+                    torch.zeros((self.feat_update_step, 4), dtype=torch.float32)
+                )
+                self.role_aware_adapters = nn.ModuleList(
+                    [
+                        nn.ModuleList(
+                            [
+                                _RoleAwareLowRankAdapter(
+                                    self.graph_dim,
+                                    self.role_aware_adapter_rank,
+                                    seed=1729 + 4 * layer_idx + view_idx,
+                                )
+                                for view_idx in range(4)
+                            ]
+                        )
+                        for layer_idx in range(self.feat_update_step)
+                    ]
+                )
 
         if self.tail_aux_enabled:
             tail_aux_hidden_dim = int(
@@ -2920,6 +3213,15 @@ class RPCMLegacy(nn.Module):
             f"obj_glove_missing={obj_text_diag.get('missing_predicates', obj_text_diag.get('missing_classes', []))}",
             flush=True,
         )
+        if self.relation_graph_mode == "role_aware":
+            print(
+                "[RPCM_ROLE_AWARE] views=SS,OO,OS,SO, "
+                f"max_log_weight={self.role_aware_max_log_weight}, "
+                f"residual_max_weight={self.role_aware_residual_max_weight}, "
+                f"adapter_rank={self.role_aware_adapter_rank}, "
+                "initialization=unified-equivalent",
+                flush=True,
+            )
 
     def _get_map_idxs(self, proposals: Sequence, proposal_pairs: Sequence[torch.Tensor]):
         obj_num = sum(len(p) for p in proposals)
@@ -2987,7 +3289,7 @@ class RPCMLegacy(nn.Module):
         subj_pred_map[rel_inds[:, 0], arange_rel] = 1.0
         obj_pred_map[rel_inds[:, 1], arange_rel] = 1.0
 
-        if self.relation_graph_mode in {"sgg_toolkit", "unified"}:
+        if self.relation_graph_mode in {"sgg_toolkit", "unified", "role_aware"}:
             # One E x E adjacency is sufficient for the STAR-style graph. The
             # endpoint incidence product includes subject-subject,
             # object-object, and both cross-role sharing cases without first
@@ -3080,9 +3382,14 @@ class RPCMLegacy(nn.Module):
 
         pred_pred_unified = (
             pred_pred_subj
-            if self.relation_graph_mode in {"sgg_toolkit", "unified"}
+            if self.relation_graph_mode in {"sgg_toolkit", "unified", "role_aware"}
             else None
         )
+        role_subject_endpoint = None
+        role_object_endpoint = None
+        if self.relation_graph_mode == "role_aware" and subj_pred_map.size(1) > 0:
+            role_subject_endpoint = subj_pred_map.argmax(dim=0)
+            role_object_endpoint = obj_pred_map.argmax(dim=0)
 
         obj_feats = [augment_obj_feat]
         pred_feats = [rel_feats]
@@ -3135,6 +3442,23 @@ class RPCMLegacy(nn.Module):
                 relation_sources = [source_sub_rel, source_obj_rel]
                 if self.relation_graph_mode == "unified":
                     relation_sources.append(self.gcn_rel2rel[t](pred_feats[t], pred_pred_unified))
+                elif self.relation_graph_mode == "role_aware":
+                    unified_message = self.gcn_rel2rel[t](
+                        pred_feats[t], pred_pred_unified
+                    )
+                    typed_message, _ = _role_aware_relation_message(
+                        pred_feats[t],
+                        role_subject_endpoint,
+                        role_object_endpoint,
+                        int(subj_pred_map.size(0)),
+                        self.role_aware_type_logits[t],
+                        self.role_aware_max_log_weight,
+                        source_transforms=self.role_aware_adapters[t],
+                    )
+                    relation_sources.append(
+                        unified_message
+                        + self.role_aware_residual_max_weight * typed_message
+                    )
                 else:
                     if self.rel_subj_view_enabled:
                         relation_sources.append(self.gcn_rel2rel[t](pred_feats[t], pred_pred_subj))
@@ -3235,6 +3559,687 @@ class RPCMOriginalLegacy(RPCMLegacy):
             "RPCM GloVe initialization, and radian OBB geometry",
             flush=True,
         )
+
+
+class RPCMSGGToolkitOriginal(RPCMLegacy):
+    """Original SGG-ToolKit classifier with a selectable RPCM graph front end.
+
+    ``RPCM_RELATION_GRAPH_MODE="sgg_toolkit"`` is the complete published
+    implementation. ``unified`` and ``dual_view`` retain the current RCA graph
+    front end while replacing only its post-GNN classifier with the source
+    object/predicate 300-D GloVe embeddings, gated subject/object/union
+    semantic fusion, projected cosine prototypes, per-forward KMeans coarse
+    prototypes, and five auxiliary prototype losses.
+
+    The current controlled Base experiment is PredCls-only.  Refusing other
+    tasks here prevents the audit implementation from being mistaken for the
+    separately maintained SGCls/SGDet compatibility route.
+    """
+
+    def __init__(self, cfg: dict, in_channels: int):
+        nn.Module.__init__(self)
+        self.cfg = cfg
+        self.in_channels = int(in_channels)
+        self.num_obj_classes = int(cfg["MODEL"]["ROI_BOX_HEAD"]["NUM_CLASSES"])
+        self.num_rel_classes = int(cfg["MODEL"]["ROI_RELATION_HEAD"]["NUM_CLASSES"])
+        self.hidden_dim = int(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "CONTEXT_HIDDEN_DIM",
+                default=512,
+            )
+        )
+        self.pooling_dim = int(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "CONTEXT_POOLING_DIM",
+                default=in_channels,
+            )
+        )
+        self.mlp_dim = int(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_MLP_DIM",
+                default=2048,
+            )
+        )
+        self.embed_dim = int(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_PROTO_EMBED_DIM",
+                default=300,
+            )
+        )
+        self.feat_update_step = int(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_FEAT_UPDATE_STEP",
+                default=4,
+            )
+        )
+        self.Par = int(_cfg_get(cfg, "EXP_nums", default=30))
+        self.relation_graph_mode = str(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_RELATION_GRAPH_MODE",
+                default="sgg_toolkit",
+            )
+        ).lower()
+        if self.relation_graph_mode not in {
+            "sgg_toolkit",
+            "unified",
+            "dual_view",
+        }:
+            raise ValueError(
+                "RPCM_SGG_TOOLKIT_ORIGINAL requires graph mode "
+                "'sgg_toolkit', 'unified', or 'dual_view', got "
+                f"{self.relation_graph_mode!r}."
+            )
+        self.rel_subj_view_enabled = bool(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_REL_SUBJ_VIEW_ENABLED",
+                default=True,
+            )
+        )
+        self.rel_obj_view_enabled = bool(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_REL_OBJ_VIEW_ENABLED",
+                default=True,
+            )
+        )
+        if self.relation_graph_mode == "dual_view" and not (
+            self.rel_subj_view_enabled or self.rel_obj_view_enabled
+        ):
+            raise ValueError(
+                "dual_view requires at least one enabled relation view."
+            )
+        self.exact_6850 = bool(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_LEGACY_6850_EXACT",
+                default=False,
+            )
+        )
+        self.mode = (
+            "predcls"
+            if bool(
+                _cfg_get(
+                    cfg,
+                    "MODEL",
+                    "ROI_RELATION_HEAD",
+                    "USE_GT_BOX",
+                    default=False,
+                )
+            )
+            and bool(
+                _cfg_get(
+                    cfg,
+                    "MODEL",
+                    "ROI_RELATION_HEAD",
+                    "USE_GT_OBJECT_LABEL",
+                    default=False,
+                )
+            )
+            else "unsupported"
+        )
+        if self.mode != "predcls":
+            raise ValueError(
+                "RPCM_SGG_TOOLKIT_ORIGINAL is the strict PredCls audit path; "
+                "use RPCM_ORIGINAL_LEGACY for SGCls/SGDet."
+            )
+        graph_dim = self.mlp_dim * 2
+        if self.pooling_dim != graph_dim or self.in_channels != graph_dim:
+            raise ValueError(
+                "Published RPCM requires in_channels == CONTEXT_POOLING_DIM "
+                f"== 2 * RPCM_MLP_DIM, got {self.in_channels}, "
+                f"{self.pooling_dim}, and {graph_dim}."
+            )
+        if not 2 <= self.Par <= self.num_rel_classes:
+            raise ValueError(
+                f"EXP_nums must be in [2, {self.num_rel_classes}], got {self.Par}."
+            )
+
+        self.obj_classes = list(
+            _cfg_get(cfg, "MODEL", "ROI_BOX_HEAD", "CLASS_NAMES", default=[])
+        )
+        self.rel_classes = list(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RELATION_NAMES",
+                default=[],
+            )
+        )
+        if len(self.obj_classes) < self.num_obj_classes:
+            self.obj_classes += [
+                f"class_{idx}"
+                for idx in range(len(self.obj_classes), self.num_obj_classes)
+            ]
+        if len(self.rel_classes) < self.num_rel_classes:
+            self.rel_classes += [
+                f"relation_{idx}"
+                for idx in range(len(self.rel_classes), self.num_rel_classes)
+            ]
+
+        dropout_p = float(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_DROPOUT",
+                default=0.2,
+            )
+        )
+        self.post_emb = nn.Linear(self.in_channels, self.mlp_dim * 2)
+
+        # Preserve the source constructor order because scratch experiments
+        # depend on its random/GloVe initialization sequence.
+        self.pairwise_feature_extractor = _OriginalRPCMPairwiseFeatureExtractor(
+            cfg, in_channels
+        )
+        proto_glove_path = str(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_PROTO_GLOVE_PATH",
+                default="",
+            )
+        )
+        obj_embed_vecs, obj_glove_diag = _build_sgg_toolkit_object_glove_init(
+            self.obj_classes[: self.num_obj_classes],
+            proto_glove_path,
+            self.embed_dim,
+        )
+        rel_embed_vecs, rel_glove_diag = _build_sgg_toolkit_relation_glove_init(
+            self.rel_classes[: self.num_rel_classes],
+            proto_glove_path,
+            self.embed_dim,
+        )
+        self.obj_embed = nn.Embedding(self.num_obj_classes, self.embed_dim)
+        self.rel_embed = nn.Embedding(self.num_rel_classes, self.embed_dim)
+        with torch.no_grad():
+            self.obj_embed.weight.copy_(obj_embed_vecs)
+            self.rel_embed.weight.copy_(rel_embed_vecs)
+
+        self.W_sub = MLP(self.embed_dim, self.mlp_dim // 2, self.mlp_dim, 2)
+        self.W_obj = MLP(self.embed_dim, self.mlp_dim // 2, self.mlp_dim, 2)
+        self.W_pred = MLP(self.embed_dim, self.mlp_dim // 2, self.mlp_dim, 2)
+
+        self.gate_sub = nn.Linear(self.mlp_dim * 2, self.mlp_dim)
+        self.gate_obj = nn.Linear(self.mlp_dim * 2, self.mlp_dim)
+        self.gate_pred = nn.Linear(self.mlp_dim * 2, self.mlp_dim)
+        self.vis2sem = nn.Sequential(
+            nn.Linear(self.mlp_dim, self.mlp_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
+            nn.Linear(self.mlp_dim * 2, self.mlp_dim),
+        )
+
+        self.project_head = MLP(
+            self.mlp_dim, self.mlp_dim, self.mlp_dim * 2, 2
+        )
+        # These source modules are unused by the published forward but remain
+        # registered so the module/state layout faithfully records the model.
+        self.project_head2 = MLP(
+            self.mlp_dim, self.mlp_dim, self.mlp_dim * 2, 2
+        )
+        self.linear_sub = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.linear_obj = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.linear_pred = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.linear_rel_rep = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.linear_rel_rep2 = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.norm_sub = nn.LayerNorm(self.mlp_dim)
+        self.norm_obj = nn.LayerNorm(self.mlp_dim)
+        self.norm_rel_rep = nn.LayerNorm(self.mlp_dim)
+        self.norm_rel_rep2 = nn.LayerNorm(self.mlp_dim)
+        self.dropout_sub = nn.Dropout(dropout_p)
+        self.dropout_obj = nn.Dropout(dropout_p)
+        self.dropout_rel_rep = nn.Dropout(dropout_p)
+        self.dropout_rel_rep2 = nn.Dropout(dropout_p)
+        self.dropout_rel = nn.Dropout(dropout_p)
+        self.dropout_rel2 = nn.Dropout(dropout_p)
+        self.dropout_pred = nn.Dropout(dropout_p)
+        self.down_samp = MLP(
+            self.pooling_dim, self.mlp_dim, self.mlp_dim, 2
+        )
+        self.logit_scale = nn.Parameter(
+            torch.ones((), dtype=torch.float32) * math.log(1.0 / 0.07)
+        )
+
+        self.pos_embed = nn.Sequential(
+            nn.Linear(9, 32),
+            nn.BatchNorm1d(32, momentum=0.001),
+            nn.Linear(32, 128),
+            nn.ReLU(inplace=True),
+        )
+        self.obj_embed1 = nn.Embedding(self.num_obj_classes, self.embed_dim)
+        with torch.no_grad():
+            self.obj_embed1.weight.copy_(obj_embed_vecs)
+        self.out_obj = _orig_make_fc(self.hidden_dim, self.num_obj_classes)
+        self.lin_obj_cyx = _orig_make_fc(
+            self.in_channels + self.embed_dim + 128, self.hidden_dim
+        )
+
+        if self.feat_update_step > 0 and self.relation_graph_mode == "sgg_toolkit":
+            self.gcn_collect_feat = _SGGToolkitGraphConvolutionLayerCollect(
+                graph_dim, graph_dim
+            )
+            self.gcn_update_feat = _SGGToolkitGraphConvolutionLayerUpdate()
+        elif self.feat_update_step > 0:
+            self.gcn_ent2ent = nn.ModuleList()
+            self.gcn_ent2rel = nn.ModuleList()
+            self.gcn_rel2rel = nn.ModuleList()
+            for _ in range(self.feat_update_step):
+                self.gcn_ent2ent.append(
+                    _LegacyGCNLayer(graph_dim, graph_dim, residual=True)
+                )
+                self.gcn_ent2rel.append(
+                    _LegacyGraphConvolutionLayerCollect(graph_dim, graph_dim)
+                )
+                self.gcn_rel2rel.append(
+                    _LegacyGCNLayer(graph_dim, graph_dim, residual=True)
+                )
+
+        print(
+            "[RPCM_SGG_TOOLKIT_ORIGINAL] "
+            f"graph_dim={graph_dim}, mlp_dim={self.mlp_dim}, "
+            f"feat_update_step={self.feat_update_step}, "
+            f"relation_graph={self.relation_graph_mode}, "
+            f"coarse_prototypes={self.Par}, "
+            "distance_impl=matrix, "
+            f"obj_glove_missing={obj_glove_diag.get('missing_classes', [])}, "
+            f"rel_glove_missing={rel_glove_diag.get('missing_predicates', [])}",
+            flush=True,
+        )
+
+    @staticmethod
+    def _fusion_func(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return F.relu(x + y) - (x - y).pow(2)
+
+    @staticmethod
+    def _to_onehot_logits(
+        labels: torch.Tensor, num_classes: int, fill: float = 1000.0
+    ) -> torch.Tensor:
+        logits = torch.full(
+            (labels.numel(), num_classes),
+            -fill,
+            dtype=torch.float32,
+            device=labels.device,
+        )
+        if labels.numel() > 0:
+            logits[
+                torch.arange(labels.numel(), device=labels.device),
+                labels.long(),
+            ] = fill
+        return logits
+
+    def _refine_obj_labels(
+        self, roi_features: torch.Tensor, proposals: Sequence
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        obj_labels = torch.cat(
+            [
+                proposal.get_field("labels").long().to(roi_features.device)
+                for proposal in proposals
+            ],
+            dim=0,
+        )
+
+        # The source evaluates this branch twice.  Besides being redundant,
+        # that updates BatchNorm running statistics twice during training.
+        # Preserve it here for numerical/optimization fidelity.
+        _ = self.pos_embed(_orig_encode_box_info(proposals).to(roi_features.device))
+        obj_embed = self.obj_embed1(obj_labels)
+        pos_embed = self.pos_embed(
+            _orig_encode_box_info(proposals).to(roi_features.device)
+        )
+        _ = self.lin_obj_cyx(
+            torch.cat([roi_features, obj_embed, pos_embed], dim=-1)
+        )
+        obj_preds = obj_labels
+        obj_dists = self._to_onehot_logits(
+            obj_preds, self.num_obj_classes
+        )
+        return obj_dists, obj_preds, obj_labels
+
+    def _coarse_predicate_prototypes(
+        self, predicate_proto: torch.Tensor
+    ) -> torch.Tensor:
+        try:
+            from sklearn.cluster import KMeans
+        except ImportError as exc:
+            raise RuntimeError(
+                "RPCM_SGG_TOOLKIT_ORIGINAL requires scikit-learn for the "
+                "source per-forward KMeans prototype clustering."
+            ) from exc
+
+        foreground = predicate_proto[1:].detach().cpu().numpy()
+        kmeans = KMeans(
+            n_clusters=self.Par - 1,
+            n_init=10,
+            random_state=0,
+        ).fit(foreground)
+        centers = torch.as_tensor(
+            kmeans.cluster_centers_,
+            dtype=predicate_proto.dtype,
+            device=predicate_proto.device,
+        )
+        return torch.cat([predicate_proto[:1].detach(), centers], dim=0)
+
+    def _prototype_losses(
+        self,
+        rel_rep: torch.Tensor,
+        predicate_proto1: torch.Tensor,
+        predicate_proto2: torch.Tensor,
+        predicate_proto_norm1: torch.Tensor,
+        predicate_proto_norm2: torch.Tensor,
+        rel_labels: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        target_proto_norm1 = predicate_proto_norm1.detach()
+        target_proto_norm2 = predicate_proto_norm2.detach()
+        simil_mat1 = predicate_proto_norm1 @ target_proto_norm1.t()
+        simil_mat2 = predicate_proto_norm2 @ target_proto_norm2.t()
+        l21_1 = torch.norm(
+            torch.norm(simil_mat1, p=2, dim=1), p=1
+        ) / float(self.num_rel_classes * self.num_rel_classes)
+        l21_2 = torch.norm(
+            torch.norm(simil_mat2, p=2, dim=1), p=1
+        ) / float(self.Par * self.Par)
+
+        gamma2 = 7.0
+        proto_dis_mat1 = (
+            predicate_proto1.unsqueeze(1)
+            - predicate_proto1.detach().unsqueeze(0)
+        ).norm(dim=2).pow(2)
+        proto_dis_mat2 = (
+            predicate_proto2.unsqueeze(1)
+            - predicate_proto2.detach().unsqueeze(0)
+        ).norm(dim=2).pow(2)
+        topk_proto_dis1 = torch.sort(proto_dis_mat1, dim=1).values[:, :2].sum(
+            dim=1
+        )
+        topk_proto_dis2 = torch.sort(proto_dis_mat2, dim=1).values[:, :2].sum(
+            dim=1
+        )
+        dist_loss1 = torch.maximum(
+            predicate_proto1.new_zeros((self.num_rel_classes,)),
+            -topk_proto_dis1 + gamma2,
+        ).mean()
+        dist_loss2 = torch.maximum(
+            predicate_proto2.new_zeros((self.Par,)),
+            -topk_proto_dis2 + gamma2,
+        ).mean()
+
+        if rel_labels.numel() == 0:
+            loss_dis = rel_rep.sum() * 0.0
+        else:
+            gamma1 = 1.0
+            distance_set = _matrix_squared_euclidean_distance(
+                rel_rep,
+                predicate_proto1,
+            )
+            mask_neg = distance_set.new_ones(distance_set.shape)
+            row_idx = torch.arange(rel_labels.numel(), device=rel_labels.device)
+            mask_neg[row_idx, rel_labels] = 0
+            distance_set_neg = distance_set * mask_neg
+            distance_set_pos = distance_set[row_idx, rel_labels]
+            negative_count = min(11, self.num_rel_classes)
+            topk_negative = torch.sort(distance_set_neg, dim=1).values[
+                :, :negative_count
+            ].sum(dim=1) / float(max(negative_count - 1, 1))
+            loss_dis = torch.maximum(
+                distance_set_pos.new_zeros(distance_set_pos.shape),
+                distance_set_pos - topk_negative + gamma1,
+            ).mean()
+
+        return {
+            "l21_1_loss": l21_1,
+            "l21_2_loss": l21_2,
+            "dist_loss2_1": dist_loss1,
+            "dist_loss2_2": dist_loss2,
+            "loss_dis": loss_dis,
+        }
+
+    def forward(
+        self,
+        proposals,
+        rel_pair_idxs,
+        rel_labels,
+        rel_binarys,
+        roi_features,
+        union_features,
+        logger=None,
+    ):
+        del rel_binarys, logger
+        add_losses: dict[str, torch.Tensor] = {}
+        augment_obj_feat, rel_feats = self.pairwise_feature_extractor(
+            roi_features,
+            union_features,
+            proposals,
+            rel_pair_idxs,
+        )
+        (
+            subj_pred_map,
+            obj_pred_map,
+            pred_pred_subj,
+            pred_pred_obj,
+            obj_obj_map,
+        ) = self._get_map_idxs(
+            proposals, [pair_idx.clone() for pair_idx in rel_pair_idxs]
+        )
+
+        obj_feats = [augment_obj_feat]
+        pred_feats = [rel_feats]
+        if self.relation_graph_mode == "sgg_toolkit":
+            for _ in range(self.feat_update_step):
+                t = len(obj_feats) - 1
+                source_obj = self.gcn_collect_feat(
+                    obj_feats[t], obj_feats[t], obj_obj_map, 4
+                )
+                source_rel_sub = self.gcn_collect_feat(
+                    obj_feats[t], pred_feats[t], subj_pred_map, 0
+                )
+                source_rel_obj = self.gcn_collect_feat(
+                    obj_feats[t], pred_feats[t], obj_pred_map, 1
+                )
+                source2obj_all = (
+                    source_obj + source_rel_sub + source_rel_obj
+                ) / 3.0
+                obj_feats.append(
+                    self.gcn_update_feat(obj_feats[t], source2obj_all, 0)
+                )
+
+                source_sub_rel = self.gcn_collect_feat(
+                    pred_feats[t], obj_feats[t], subj_pred_map.t(), 2
+                )
+                source_obj_rel = self.gcn_collect_feat(
+                    pred_feats[t], obj_feats[t], obj_pred_map.t(), 3
+                )
+                source_rel_rel = self.gcn_collect_feat(
+                    pred_feats[t], pred_feats[t], pred_pred_subj, 5
+                )
+                source2rel_all = (
+                    source_sub_rel + source_obj_rel + source_rel_rel
+                ) / 3.0
+                pred_feats.append(
+                    self.gcn_update_feat(pred_feats[t], source2rel_all, 1)
+                )
+            obj_features = obj_feats[-1]
+            rel_features = pred_feats[-1]
+        else:
+            for t in range(self.feat_update_step):
+                obj_feats.append(
+                    self.gcn_ent2ent[t](obj_feats[t], obj_obj_map)
+                )
+                if pred_feats[t].numel() == 0:
+                    pred_feats.append(pred_feats[t])
+                    continue
+                source_sub_rel = self.gcn_ent2rel[t](
+                    pred_feats[t], obj_feats[t], subj_pred_map.t(), 0
+                )
+                source_obj_rel = self.gcn_ent2rel[t](
+                    pred_feats[t], obj_feats[t], obj_pred_map.t(), 1
+                )
+                relation_sources = [source_sub_rel, source_obj_rel]
+                if self.relation_graph_mode == "unified":
+                    relation_sources.append(
+                        self.gcn_rel2rel[t](
+                            pred_feats[t], pred_pred_subj
+                        )
+                    )
+                else:
+                    if self.rel_subj_view_enabled:
+                        relation_sources.append(
+                            self.gcn_rel2rel[t](
+                                pred_feats[t], pred_pred_subj
+                            )
+                        )
+                    if self.rel_obj_view_enabled:
+                        relation_sources.append(
+                            self.gcn_rel2rel[t](
+                                pred_feats[t], pred_pred_obj
+                            )
+                        )
+                combined_source = relation_sources[0]
+                for source in relation_sources[1:]:
+                    combined_source = combined_source + source
+                pred_feats.append(
+                    combined_source / float(len(relation_sources))
+                )
+
+            rel_features = pred_feats[0]
+            for rel_state in pred_feats[1:]:
+                rel_features = rel_features + rel_state
+            rel_features = rel_features / float(len(pred_feats))
+            if self.exact_6850 and self.relation_graph_mode == "dual_view":
+                obj_features = obj_feats[0]
+                for obj_state in obj_feats[1:]:
+                    obj_features = obj_features + obj_state
+                obj_features = obj_features / float(len(obj_feats))
+            else:
+                obj_features = obj_feats[-1]
+
+        entity_dists, entity_preds, _ = self._refine_obj_labels(
+            obj_features, proposals
+        )
+
+        entity_rep = self.post_emb(obj_features).view(
+            obj_features.size(0), 2, self.mlp_dim
+        )
+        sub_rep = entity_rep[:, 1].contiguous().view(-1, self.mlp_dim)
+        obj_rep = entity_rep[:, 0].contiguous().view(-1, self.mlp_dim)
+        entity_embeds = self.obj_embed(entity_preds)
+
+        num_rels = [pair_idx.shape[0] for pair_idx in rel_pair_idxs]
+        num_objs = [len(proposal) for proposal in proposals]
+        sub_reps = sub_rep.split(num_objs, dim=0)
+        obj_reps = obj_rep.split(num_objs, dim=0)
+        entity_embeds = entity_embeds.split(num_objs, dim=0)
+
+        fusion_so_parts: list[torch.Tensor] = []
+        for pair_idx, sub_i, obj_i, embed_i in zip(
+            rel_pair_idxs, sub_reps, obj_reps, entity_embeds
+        ):
+            if pair_idx.numel() == 0:
+                continue
+            pair_idx = pair_idx.long()
+            s_embed = self.W_sub(embed_i[pair_idx[:, 0]])
+            o_embed = self.W_obj(embed_i[pair_idx[:, 1]])
+            sem_sub = self.vis2sem(sub_i[pair_idx[:, 0]])
+            sem_obj = self.vis2sem(obj_i[pair_idx[:, 1]])
+            gate_sem_sub = torch.sigmoid(
+                self.gate_sub(torch.cat([s_embed, sem_sub], dim=-1))
+            )
+            gate_sem_obj = torch.sigmoid(
+                self.gate_obj(torch.cat([o_embed, sem_obj], dim=-1))
+            )
+            sub = s_embed + sem_sub * gate_sem_sub
+            obj = o_embed + sem_obj * gate_sem_obj
+            sub = self.norm_sub(
+                self.dropout_sub(F.relu(self.linear_sub(sub))) + sub
+            )
+            obj = self.norm_obj(
+                self.dropout_obj(F.relu(self.linear_obj(obj))) + obj
+            )
+            fusion_so_parts.append(self._fusion_func(sub, obj))
+
+        if fusion_so_parts:
+            fusion_so = torch.cat(fusion_so_parts, dim=0)
+        else:
+            fusion_so = obj_features.new_zeros((0, self.mlp_dim))
+        sem_pred = self.vis2sem(self.down_samp(rel_features))
+        gate_sem_pred = torch.sigmoid(
+            self.gate_pred(torch.cat([fusion_so, sem_pred], dim=-1))
+        )
+        rel_rep = fusion_so - sem_pred * gate_sem_pred
+
+        predicate_proto1 = self.W_pred(self.rel_embed.weight)
+        predicate_proto2 = self._coarse_predicate_prototypes(
+            predicate_proto1
+        )
+        rel_rep = self.norm_rel_rep(
+            self.dropout_rel_rep(F.relu(self.linear_rel_rep(rel_rep))) + rel_rep
+        )
+        rel_rep = self.project_head(self.dropout_rel(F.relu(rel_rep)))
+        predicate_proto1 = self.project_head(
+            self.dropout_pred(F.relu(predicate_proto1))
+        )
+        predicate_proto2 = self.project_head(
+            self.dropout_pred(F.relu(predicate_proto2))
+        )
+
+        rel_rep_norm = rel_rep / rel_rep.norm(dim=1, keepdim=True)
+        predicate_proto_norm1 = predicate_proto1 / predicate_proto1.norm(
+            dim=1, keepdim=True
+        )
+        predicate_proto_norm2 = predicate_proto2 / predicate_proto2.norm(
+            dim=1, keepdim=True
+        )
+        relation_logits = (
+            rel_rep_norm @ predicate_proto_norm1.t()
+        ) * self.logit_scale.exp()
+
+        if self.training:
+            flat_rel_labels = (
+                torch.cat(rel_labels, dim=0).long().to(relation_logits.device)
+                if rel_labels
+                else relation_logits.new_zeros((0,), dtype=torch.long)
+            )
+            add_losses.update(
+                self._prototype_losses(
+                    rel_rep,
+                    predicate_proto1,
+                    predicate_proto2,
+                    predicate_proto_norm1,
+                    predicate_proto_norm2,
+                    flat_rel_labels,
+                )
+            )
+
+        relation_logits = list(relation_logits.split(num_rels, dim=0))
+        refine_logits = list(entity_dists.split(num_objs, dim=0))
+        return relation_logits, refine_logits, add_losses
 
 
 class QueryHierarchyRelationPredictor(nn.Module):
@@ -3683,6 +4688,11 @@ def make_roi_relation_predictor(cfg: dict, in_channels: int):
     predictor_name = str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PREDICTOR", default="Placeholder")).upper()
     if predictor_name in {"HIER_SUBGRAPH", "QUERY_HIERARCHY", "QHSG"}:
         return QueryHierarchyRelationPredictor(cfg, in_channels)
+    if predictor_name in {
+        "RPCM_SGG_TOOLKIT_ORIGINAL",
+        "SGG_TOOLKIT_RPCM_ORIGINAL",
+    }:
+        return RPCMSGGToolkitOriginal(cfg, in_channels)
     if predictor_name in {"RPCM_ORIGINAL_LEGACY", "ORIGINAL_RPCM_LEGACY", "RPCM_NATIVE_LEGACY"}:
         return RPCMOriginalLegacy(cfg, in_channels)
     if predictor_name in {"RPCM_LEGACY", "LEGACY_RPCM"}:

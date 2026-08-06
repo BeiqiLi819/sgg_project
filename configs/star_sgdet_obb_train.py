@@ -1,4 +1,8 @@
-"""Main configuration for STAR OBB Scene Graph Detection (SGDet).
+"""Historical HPRC-compatible STAR OBB SGDet configuration.
+
+New paper-main runs use ``star_sgdet_obb_dual_la_train.py``. This file remains
+structurally compatible with existing SGDet HPRC checkpoints and the original
+cache-building experiments.
 
 Task protocol: boxes, object labels, and predicates are all predicted. The
 frozen detector is initialized from ``pretrained/OBB_swin_L_OBD.pth`` and uses
@@ -8,7 +12,7 @@ pipeline to generate proposals. Only the relation stack is updated in training.
 Performance constraint: raw remote-sensing images can exceed 10k pixels. Do
 not rerun the frozen detector at every relation step. Formal training reads
 the v5 detection cache by default:
-    outputs/star_sgdet_detection_cache/{train,test}/*.pt
+    star_sgdet_detection_cache/{train,val,test}/*.pt
 
 The cache stores detector proposals/logits only, not GT labels or relations.
 The same cache can therefore switch between matched_gt and pred label
@@ -17,7 +21,7 @@ falling back to the slow detector.
 
 Typical workflow:
     bash scripts/build_sgdet_detection_cache.sh
-    bash scripts/run_star_sgdet_experiment.sh
+    bash scripts/_internal/run_star_sgdet_experiment.sh
 """
 
 from __future__ import annotations
@@ -123,7 +127,7 @@ cfg["MODEL"]["SGDET_COMPAT"].update(
             "ENABLED": _sgdet_detection_cache_enabled,
             "DIR": os.environ.get(
                 "SGDET_DETECTION_CACHE_DIR",
-                "outputs/star_sgdet_detection_cache",
+                "star_sgdet_detection_cache",
             ),
             "REQUIRE_HIT": os.environ.get("SGDET_DETECTION_CACHE_REQUIRE_HIT", "1").strip().lower()
             not in {"0", "false", "no", "off", ""},
@@ -150,7 +154,7 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ENABLED"] = _filter_method == "RSGP"
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_MODE"] = os.environ.get("RSGP_MODE", "HYBRID").upper()
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_TOPK"] = int(os.environ.get("RSGP_TOPK", "10000"))
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_PPG_PROTECTED_TOPK"] = int(
-    os.environ.get("RSGP_PPG_PROTECTED_TOPK", "8000")
+    os.environ.get("RSGP_PPG_PROTECTED_TOPK", "9000")
 )
 # PPG scores candidates before reducing to top-10000.  Bound the temporary
 # score/features chunk, not the original detector's post-NMS candidate set.
@@ -192,5 +196,5 @@ cfg["SOLVER"]["VAL_START_PERIOD"] = int(os.environ.get("VAL_START_PERIOD", "7000
 cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "0"))
 cfg["SOLVER"]["PRINT_TRAIN_STEP_FREQ"] = int(os.environ.get("PRINT_TRAIN_STEP_FREQ", "0"))
 cfg["SOLVER"]["PRINT_TRAIN_BATCH_FREQ"] = int(os.environ.get("PRINT_TRAIN_BATCH_FREQ", "0"))
-cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "test")
+cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "val")
 cfg["SOLVER"]["OUTPUT_DIR"] = os.environ.get("OUTPUT_DIR", "outputs/star_sgdet_obb_train")

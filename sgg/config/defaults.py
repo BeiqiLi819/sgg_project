@@ -54,7 +54,7 @@ def get_default_cfg():
                 # to the multi-minute raw detector path.
                 "DETECTION_CACHE": {
                     "ENABLED": False,
-                    "DIR": "outputs/star_sgdet_detection_cache_v5",
+                    "DIR": "star_sgdet_detection_cache",
                     "REQUIRE_HIT": True,
                     "HASH": "",
                 },
@@ -199,7 +199,9 @@ def get_default_cfg():
                 "RSGP_THRESHOLD": 10000,
                 "RSGP_TOPK": 10000,
                 "RSGP_CHUNK_SIZE": 200000,
-                "RSGP_PPG_PROTECTED_TOPK": 7000,
+                # Validation-selected paper default: protect 9,000 PPG edges
+                # and use PPN/RSGP evidence to complete the 10,000-edge graph.
+                "RSGP_PPG_PROTECTED_TOPK": 9000,
                 "RSGP_PPN_POOL_TOPK": 12000,
                 "RSGP_RS_POOL_TOPK": 12000,
                 "RSGP_MAX_OUT_DEGREE": 96,
@@ -214,10 +216,27 @@ def get_default_cfg():
                 "RSGP_W_TOPO": 0.20,
                 "RSGP_W_TAIL": 0.15,
                 "RSGP_W_DEGREE": 0.15,
+                # Paper-facing RSGP uses train-derived soft structural roles
+                # and never resolves hand-written class-name groups.
+                # legacy_manual remains available only to replay RSGP-v1.
+                "RSGP_ROLE_MODE": "statistical",  # statistical | legacy_manual
+                "RSGP_STRUCTURAL_PRIOR_PATH": "pretrained/rsgp_structural_prior.json",
+                "RSGP_STRUCTURAL_PRIOR_HASH": "",
+                "RSGP_CONTEXT_CARRIER_MIN": 16,
+                "RSGP_CONTEXT_CARRIER_MAX": 128,
+                "RSGP_CONTEXT_CARRIER_SCALE": 2.0,
+                "RSGP_W_CONTEXT": 0.25,
+                "RSGP_W_ALIGNMENT": 0.10,
+                "RSGP_W_CONNECTIVITY": 0.10,
+                "RSGP_W_RARITY": 0.15,
                 # Component switches used for inference-only RSGP ablations.
-                # Defaults preserve the full RSGP behavior.
+                # The legacy aliases below are read only in legacy_manual mode.
                 "RSGP_USE_PPN_COMPLETION": True,
                 "RSGP_USE_GEOMETRY": True,
+                "RSGP_USE_CONTEXT_ROLE": True,
+                "RSGP_USE_ALIGNMENT_ROLE": True,
+                "RSGP_USE_CONNECTIVITY_ROLE": True,
+                "RSGP_USE_RARITY_PRIOR": True,
                 "RSGP_USE_ANCHOR": True,
                 "RSGP_USE_TOPOLOGY": True,
                 "RSGP_USE_TAIL_PRIOR": True,
@@ -236,11 +255,14 @@ def get_default_cfg():
                 # share either endpoint (including subject/object cross-role
                 # matches).  ``dual_view`` keeps shared-subject and
                 # shared-object graphs separate.  Both modes reuse the same
-                # GCN parameters, so changing this flag does not change the
-                # checkpoint structure.
-                "RPCM_RELATION_GRAPH_MODE": "dual_view",  # sgg_toolkit | unified | dual_view
+                # GCN parameters. ``role_aware`` keeps unified support and
+                # adds a zero-initialized, bounded SS/OO/OS/SO residual.
+                "RPCM_RELATION_GRAPH_MODE": "dual_view",  # sgg_toolkit | unified | dual_view | role_aware
                 "RPCM_REL_SUBJ_VIEW_ENABLED": True,
                 "RPCM_REL_OBJ_VIEW_ENABLED": True,
+                "RPCM_ROLE_AWARE_MAX_LOG_WEIGHT": 1.0,
+                "RPCM_ROLE_AWARE_RESIDUAL_MAX_WEIGHT": 0.25,
+                "RPCM_ROLE_AWARE_ADAPTER_RANK": 32,
                 # Exact training behavior of RPCM/weights/6850_4135.pth:
                 # K=1 prototypes, static initialization EMA, historic antonym
                 # loss, and layer-averaged dual-view object/relation states.
@@ -307,6 +329,10 @@ def get_default_cfg():
             "TEST_BATCH_SIZE": 4,
             "NUM_WORKERS": 6,
             "SIZE_DIVISIBLE": 0,
+            # Opt-in compatibility with the source maskrcnn-benchmark loader.
+            # Keep disabled so established project experiments preserve their
+            # original random batching behavior.
+            "ASPECT_RATIO_GROUPING": False,
         },
         "SOLVER": {
             "GRADIENT_ACCUMULATION_STEPS": 1,
@@ -328,7 +354,19 @@ def get_default_cfg():
             "CHECKPOINT_PERIOD": 1,
             "VAL_PERIOD": 1,
             "VAL_START_PERIOD": 0,
+            # When enabled together with ITERATION_COMPAT, validation runs at
+            # exact optimizer-step boundaries instead of rounded epoch
+            # boundaries.  It is opt-in to preserve existing task configs.
+            "VALIDATE_ON_ITER": False,
             "VAL_SPLIT": "val",
+            # Validation-level early stopping. PATIENCE counts completed
+            # validation events rather than epochs; disabled by default so
+            # existing configs retain their original stopping behavior.
+            "EARLY_STOP_ENABLED": False,
+            "EARLY_STOP_METRIC": "HR",
+            "EARLY_STOP_PATIENCE": 10,
+            "EARLY_STOP_MIN_DELTA": 0.0,
+            "EARLY_STOP_START_PERIOD": 0,
             "PRINT_GRAD_FREQ": 0,
             "PRINT_TRAIN_STEP_FREQ": 0,
             "PRINT_TRAIN_BATCH_FREQ": 0,
@@ -348,11 +386,16 @@ def get_default_cfg():
             "OUTPUT_DIR": "outputs/default",
         },
         "RUNTIME": {
+            # None retains the caller's ambient RNG state.  Historical
+            # reproduction configs may opt into an explicit seed.
+            "SEED": None,
+            "STRICT_REPRODUCIBILITY": False,
             "DISABLE_CUDNN": True,
             "CUDNN_BENCHMARK": False,
             "CUDNN_DETERMINISTIC": True,
         },
         "TEST": {
+            "PROFILE_INFERENCE": False,
             "RECALL_AT": [20, 50, 100],
             "IOU_THRESHOLD": 0.5,
             "RELATION": {

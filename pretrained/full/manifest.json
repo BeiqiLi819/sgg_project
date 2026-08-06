@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "method": "Dual-view RCA + auxiliary LA + statistical RSGP Hybrid 9000/1000",
+  "shared_assets": [
+    "pretrained/OBB_swin_L_OBD.pth",
+    "pretrained/STAR_OBB.pth",
+    "pretrained/PPN_OBB.pth",
+    "pretrained/rsgp_structural_prior.json"
+  ],
+  "checkpoints": {
+    "predcls": {
+      "file": "pretrained/full/STAR_OBB_Full_PredCls.pth",
+      "source": "outputs/paper_submission/predcls/dual_la/model_best_HR.pth",
+      "config": "configs/star_predcls_obb_full.py",
+      "selection": "best validation HMR",
+      "test_metrics_at_2000": {
+        "R": 0.6857963038271498,
+        "mR": 0.4538116050821365,
+        "HMR": 0.5461919296384402
+      },
+      "metrics_source": "outputs/paper_submission/predcls/dual_la/rsgp_component_test/rsgp_full/test_metrics.json",
+      "size_bytes": 5816104566,
+      "sha256": "1b9472f41f686cee9d3614dc1f400e45945f415cb4511237cf55773a02c4391e"
+    },
+    "sgcls": {
+      "file": "pretrained/full/STAR_OBB_Full_SGCls.pth",
+      "source": "outputs/star_sgcls_obb_dual_la_train/model_best_HR.pth",
+      "config": "configs/star_sgcls_obb_full.py",
+      "selection": "best validation HMR",
+      "filter_label_protocol": "gt",
+      "test_metrics_at_2000": {
+        "R": 0.5777950217564153,
+        "mR": 0.3374866177534575,
+        "HMR": 0.4260941752350198
+      },
+      "metrics_source": "outputs/paper_submission/sgcls/test/legacy/rsgp_statistical/test_metrics.json",
+      "size_bytes": 5355668738,
+      "sha256": "f53026242a5d2d80668c8fc31731f6bd6faf2a408c5b6f09fc6f52fdaa3413f7"
+    },
+    "sgdet": {
+      "file": "pretrained/full/STAR_OBB_Full_SGDet.pth",
+      "source": "outputs/star_sgdet_obb_dual_la_rpcm_budget/model_last.pth",
+      "config": "configs/star_sgdet_obb_full.py",
+      "selection": "final checkpoint at fixed 5000-step budget",
+      "filter_label_protocol": "matched_gt",
+      "test_metrics_at_2000": {
+        "R": 0.33650153597201493,
+        "mR": 0.14546441413777406,
+        "HMR": 0.20312222793116386
+      },
+      "metrics_source": "outputs/paper_submission/sgdet_rpcm_budget/test/legacy/rsgp_statistical/test_metrics.json",
+      "size_bytes": 5355661751,
+      "sha256": "42c42738b13b14b3ae25df3b1db5ffc2de7889bec2b7e87dca0f0eeb93018a67"
+    }
+  }
+}

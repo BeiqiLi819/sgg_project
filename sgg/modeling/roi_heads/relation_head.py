@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Sequence
 
 import torch
@@ -97,6 +98,7 @@ class ROIRelationHead(nn.Module):
         self.predictor_name = str(rel_cfg.get("PREDICTOR", ""))
         self.legacy_filter_flow = bool(rel_cfg.get("RPCM_LEGACY_FILTER_FLOW", False))
         self.num_obj_classes = int(cfg["MODEL"]["ROI_BOX_HEAD"]["NUM_CLASSES"])
+        self.profile_inference = bool(cfg.get("TEST", {}).get("PROFILE_INFERENCE", False))
 
     def _feature_device(self, features) -> torch.device:
         if isinstance(features, torch.Tensor):
@@ -143,46 +145,60 @@ class ROIRelationHead(nn.Module):
 
     def _filter_test_pairs_for_proposal(self, proposal, pair_idx: torch.Tensor) -> torch.Tensor:
         """Apply semantic and learned pair filters under the selected label source."""
-        filter_labels, resolved_source = self._filter_labels_for_proposal(proposal)
-        proposal.add_field("filter_label_source", resolved_source)
-        if filter_labels is None:
-            proposal.add_field("sema_rel_pair_idxs", pair_idx)
-            proposal.add_field("final_rel_pair_idxs", pair_idx)
-            proposal.add_field("pruned_rel_pair_idxs", pair_idx)
-            return pair_idx
-
-        proposal.add_field("filter_labels", filter_labels)
-        if self.sema_filter.enabled:
-            pair_idx = self.sema_filter.filter_pairs(pair_idx, filter_labels)
-        sema_pair_idx = pair_idx
-        proposal.add_field("sema_rel_pair_idxs", sema_pair_idx)
-
-        # PPG, PPN and RSGP all consume proposal.labels.  Temporarily expose
-        # the selected filter labels only for their scoring path, then restore
-        # the standard sgcls predicted labels used by the predictor/postprocess.
-        original_labels = proposal.get_field("labels")
-        swap_labels = filter_labels.data_ptr() != original_labels.data_ptr()
-        if swap_labels:
-            proposal.add_field("labels", filter_labels)
+        profile_inference = bool(getattr(self, "profile_inference", False))
+        profile_cuda = profile_inference and pair_idx.is_cuda
+        if profile_cuda:
+            torch.cuda.synchronize(pair_idx.device)
+        profile_start = time.perf_counter() if profile_inference else 0.0
         try:
-            if (
-                self.legacy_filter_flow
-                and self.filter_method == "RANDOM_FILTER"
-                and sema_pair_idx.size(0) > self.ppg.threshold
-            ):
-                rand_idx = torch.randperm(sema_pair_idx.size(0), device=sema_pair_idx.device)
-                filtered_pair_idx = sema_pair_idx[rand_idx[: self.ppg.topk]]
-            elif self.ppg.filter_method in {"PPG", "PPN", "RSGP"}:
-                filtered_pair_idx = self.ppg.filter_pairs(proposal, sema_pair_idx)
-            else:  # Constructor validates this; keep failure local if a filter mutates itself.
-                raise RuntimeError(f"Unsupported active pair filter {self.ppg.filter_method!r}")
-        finally:
-            if swap_labels:
-                proposal.add_field("labels", original_labels)
+            filter_labels, resolved_source = self._filter_labels_for_proposal(proposal)
+            proposal.add_field("filter_label_source", resolved_source)
+            if filter_labels is None:
+                proposal.add_field("sema_rel_pair_idxs", pair_idx)
+                proposal.add_field("final_rel_pair_idxs", pair_idx)
+                proposal.add_field("pruned_rel_pair_idxs", pair_idx)
+                return pair_idx
 
-        proposal.add_field("final_rel_pair_idxs", filtered_pair_idx)
-        proposal.add_field("pruned_rel_pair_idxs", filtered_pair_idx)
-        return filtered_pair_idx
+            proposal.add_field("filter_labels", filter_labels)
+            if self.sema_filter.enabled:
+                pair_idx = self.sema_filter.filter_pairs(pair_idx, filter_labels)
+            sema_pair_idx = pair_idx
+            proposal.add_field("sema_rel_pair_idxs", sema_pair_idx)
+
+            # PPG, PPN and RSGP all consume proposal.labels. Temporarily expose
+            # the selected filter labels only for their scoring path.
+            original_labels = proposal.get_field("labels")
+            swap_labels = filter_labels.data_ptr() != original_labels.data_ptr()
+            if swap_labels:
+                proposal.add_field("labels", filter_labels)
+            try:
+                if (
+                    self.legacy_filter_flow
+                    and self.filter_method == "RANDOM_FILTER"
+                    and sema_pair_idx.size(0) > self.ppg.threshold
+                ):
+                    rand_idx = torch.randperm(sema_pair_idx.size(0), device=sema_pair_idx.device)
+                    filtered_pair_idx = sema_pair_idx[rand_idx[: self.ppg.topk]]
+                elif self.ppg.filter_method in {"PPG", "PPN", "RSGP"}:
+                    filtered_pair_idx = self.ppg.filter_pairs(proposal, sema_pair_idx)
+                else:
+                    raise RuntimeError(f"Unsupported active pair filter {self.ppg.filter_method!r}")
+            finally:
+                if swap_labels:
+                    proposal.add_field("labels", original_labels)
+
+            proposal.add_field("final_rel_pair_idxs", filtered_pair_idx)
+            proposal.add_field("pruned_rel_pair_idxs", filtered_pair_idx)
+            return filtered_pair_idx
+        finally:
+            if profile_inference:
+                if profile_cuda:
+                    torch.cuda.synchronize(pair_idx.device)
+                elapsed = time.perf_counter() - profile_start
+                proposal.add_field(
+                    "pair_proposal_time_seconds",
+                    proposal.bbox.new_tensor([elapsed], dtype=torch.float64),
+                )
 
     def forward(
         self,

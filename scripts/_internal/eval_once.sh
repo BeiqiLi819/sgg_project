@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-sgg}"
@@ -11,11 +11,12 @@ DEVICE="${DEVICE:-cuda}"
 FILTER_METHOD="${FILTER_METHOD:-}"
 PAIR_FILTER_CHECKPOINT="${PAIR_FILTER_CHECKPOINT:-}"
 CHECKPOINT_LOAD_MODE="${CHECKPOINT_LOAD_MODE:-full}"
+RUN_BACKGROUND="${RUN_BACKGROUND:-1}"
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  CONFIG=... CHECKPOINT=... OUTPUT_DIR=... [options] bash scripts/eval_once.sh
+  CONFIG=... CHECKPOINT=... OUTPUT_DIR=... [options] bash scripts/_internal/eval_once.sh
 
 Required:
   CONFIG       Python config used to build the model.
@@ -83,9 +84,24 @@ if [[ -n "${MAX_IMAGES:-}" ]]; then
   cmd+=(--max-images "${MAX_IMAGES}")
 fi
 
-nohup "${cmd[@]}" > "${LOG_FILE}" 2>&1 &
+if [[ "${RUN_BACKGROUND}" == "0" ]]; then
+  "${cmd[@]}" > "${LOG_FILE}" 2>&1 &
+  pid="$!"
+  echo "Running evaluation in the foreground wrapper with PID ${pid}"
+  set +e
+  wait "${pid}"
+  status="$?"
+  set -e
+  echo "${status}" > "${OUTPUT_DIR}/eval_exit_code.txt"
+  if [[ "${status}" -ne 0 ]]; then
+    echo "Evaluation failed; see ${LOG_FILE}" >&2
+  fi
+else
+  nohup "${cmd[@]}" > "${LOG_FILE}" 2>&1 &
+  pid="$!"
+  echo "Started evaluation with PID ${pid}"
+fi
 
-echo "Started evaluation with PID $!"
 echo "Config: ${CONFIG}"
 echo "Checkpoint: ${CHECKPOINT}"
 echo "Split: ${SPLIT}"
@@ -94,3 +110,7 @@ echo "Pair filter checkpoint override: ${PAIR_FILTER_CHECKPOINT:-<config>}"
 echo "Load mode: ${CHECKPOINT_LOAD_MODE}"
 echo "Log: ${LOG_FILE}"
 echo "JSON: ${OUTPUT_JSON}"
+
+if [[ "${RUN_BACKGROUND}" == "0" ]]; then
+  exit "${status}"
+fi

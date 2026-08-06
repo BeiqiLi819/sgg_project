@@ -5,11 +5,20 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.dylib
+*.dll
+*.o
+*.a
 
 build/
 dist/
 *.egg-info/
 .eggs/
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+.ninja_deps
+.ninja_log
 
 .venv/
 venv/
@@ -24,6 +33,8 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.cache/
 .coverage
 coverage.xml
 htmlcov/
@@ -40,16 +51,28 @@ htmlcov/
 # Runtime outputs
 # ---------------------------------------------------------------------------
 /outputs/
+/outputs_old/
 /runs/
 /logs/
 /wandb/
 /tensorboard/
+/artifacts/
+/profiler/
+/predictions/
+/tmp/
 
 *.log
 nohup.out
 *.pid
 exit_code.txt
 cmdlines.txt
+events.out.tfevents.*
+*.prof
+*.trace
+*.trace.json
+slurm-*.out
+/core
+/core.*
 
 # ---------------------------------------------------------------------------
 # Local datasets, embeddings, checkpoints, and generated caches
@@ -60,15 +83,26 @@ cmdlines.txt
 /glove/
 /checkpoints/
 /weights/
+/cache/
+/caches/
+/star_sgdet_detection_cache*/
 
 *.pth
 *.pt
 *.ckpt
+*.safetensors
 *.onnx
 *.engine
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
 
-# Keep small JSON metadata under pretrained/ trackable. The global weight
-# patterns above exclude only binary model files.
+# Keep small JSON metadata under pretrained/ trackable. In particular,
+# pretrained/full/{README.md,manifest.json} describe the public release while
+# the multi-gigabyte .pth assets stay outside Git.
 
 # ---------------------------------------------------------------------------
 # Generated diagnostics and local reference material
@@ -80,9 +114,19 @@ diag_*.json
 
 /Star A first-ever dataset and a large-scale benchmark for scene graph generation in large-size satellite imagery.pdf
 
+# LaTeX build products (source .tex/.bib files and final figures stay tracked)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.synctex.gz
+*.toc
+
 # ---------------------------------------------------------------------------
 # Local Codex/agent state
 # ---------------------------------------------------------------------------
-.agents/
-.codex
-.codex/
+/.agents/
+/.codex

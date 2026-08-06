@@ -1,4 +1,8 @@
-"""Main configuration for STAR OBB Scene Graph Classification (SGCls).
+"""Historical HPRC-compatible STAR OBB SGCls configuration.
+
+New paper-main runs use ``star_sgcls_obb_dual_la_train.py``. This file remains
+unchanged structurally so previously trained SGCls HPRC checkpoints can still
+be replayed.
 
 Task protocol: GT OBBs are provided, while both object labels and predicates
 are predicted by the model.
@@ -13,7 +17,7 @@ The last item affects only candidate pairs from Semantic Filter/PPG/PPN/RSGP;
 it does not write GT labels into the final object predictions. Set
 SGCLS_FILTER_LABEL_SOURCE=pred for a strict fully predicted-label ablation.
 
-Typical launch command: bash scripts/run_star_sgcls_experiment.sh
+Typical launch command: bash scripts/research/run_star_sgcls_experiment.sh
 """
 
 from __future__ import annotations
@@ -66,7 +70,7 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ENABLED"] = _filter_method == "RSGP"
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_MODE"] = os.environ.get("RSGP_MODE", "HYBRID").upper()
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_TOPK"] = int(os.environ.get("RSGP_TOPK", "10000"))
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_PPG_PROTECTED_TOPK"] = int(
-    os.environ.get("RSGP_PPG_PROTECTED_TOPK", "8000")
+    os.environ.get("RSGP_PPG_PROTECTED_TOPK", "9000")
 )
 # The PPG score is evaluated before its top-k reduction.  The original
 # all-pair protocol remains intact, while this chunk cap keeps very large
@@ -101,5 +105,5 @@ cfg["SOLVER"]["ITERATION_COMPAT"] = True
 cfg["SOLVER"]["VAL_PERIOD"] = int(os.environ.get("VAL_PERIOD", "100"))
 cfg["SOLVER"]["VAL_START_PERIOD"] = int(os.environ.get("VAL_START_PERIOD", "10000"))
 cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "0"))
-cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "test")
+cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "val")
 cfg["SOLVER"]["OUTPUT_DIR"] = os.environ.get("OUTPUT_DIR", "outputs/star_sgcls_obb_train")
