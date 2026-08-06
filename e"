@@ -1,0 +1,108 @@
+ .gitignore                                                       |   54 [32m+[m[31m-[m
+ INSTALL.md                                                       |   33 [32m+[m[31m-[m
+ README.md                                                        |  311 [32m++[m[31m--[m
+ configs/star_predcls_obb_ablation_dual_6850_repro_train.py       |   99 [32m++[m
+ configs/star_predcls_obb_ablation_dual_la_original_head_train.py |   64 [32m+[m
+ configs/star_predcls_obb_ablation_dual_la_train.py               |   38 [32m+[m[31m-[m
+ configs/star_predcls_obb_ablation_dual_rca_train.py              |   37 [32m+[m[31m-[m
+ configs/star_predcls_obb_ablation_role_aware_train.py            |   35 [32m+[m
+ configs/star_predcls_obb_ablation_sgg_toolkit_base_train.py      |   66 [32m+[m
+ configs/star_predcls_obb_ablation_unified_rca_train.py           |   57 [32m+[m[31m-[m
+ configs/star_predcls_obb_full.py                                 |   19 [32m+[m
+ configs/star_predcls_obb_rpcm_audit_train.py                     |   47 [32m+[m
+ configs/star_predcls_obb_tail_aux_train.py                       |    6 [32m+[m[31m-[m
+ configs/star_predcls_obb_train.py                                |   66 [32m+[m[31m-[m
+ configs/star_sgcls_obb_dual_la_train.py                          |   49 [32m+[m
+ configs/star_sgcls_obb_full.py                                   |   19 [32m+[m
+ configs/star_sgcls_obb_train.py                                  |   12 [32m+[m[31m-[m
+ configs/star_sgdet_obb_dual_la_rpcm_budget_train.py              |   50 [32m+[m
+ configs/star_sgdet_obb_dual_la_train.py                          |   49 [32m+[m
+ configs/star_sgdet_obb_full.py                                   |   19 [32m+[m
+ configs/star_sgdet_obb_train.py                                  |   16 [32m+[m[31m-[m
+ docs/assets/paper/fig_qualitative_failure_0235.png               |  Bin [31m0[m -> [32m2485967[m bytes
+ docs/assets/paper/fig_qualitative_success_0440.png               |  Bin [31m0[m -> [32m3331478[m bytes
+ docs/assets/paper/fig_qualitative_success_0748.png               |  Bin [31m0[m -> [32m2797188[m bytes
+ docs/environment_setup.md                                        |   54 [32m+[m[31m-[m
+ docs/paper_contributions_and_experiments.md                      | 2049 [32m++++++++++++[m[31m-------------[m
+ docs/paper_ready_manuscript.md                                   |  776 [32m++++++++++[m
+ docs/per_predicate_supplement.md                                 |   66 [32m+[m
+ docs/rsgp_technical_route.md                                     |  469 [32m+++[m[31m---[m
+ docs/submission_experiment_protocol.md                           |  451 [32m++++++[m
+ pretrained/full/README.md                                        |   55 [32m+[m
+ pretrained/full/manifest.json                                    |   56 [32m+[m
+ pretrained/rsgp_structural_prior.json                            | 2965 [32m++++++++++++++++++++++++++++++++++++[m
+ scripts/README.md                                                |  104 [32m++[m
+ scripts/{ => _internal}/eval_once.sh                             |   28 [32m+[m[31m-[m
+ scripts/_internal/eval_paper_cross_task.sh                       |   91 [32m++[m
+ scripts/_internal/eval_predcls_minimal_ablation.sh               |   88 [32m++[m
+ scripts/{ => _internal}/eval_rsgp_grid.sh                        |   74 [32m+[m[31m-[m
+ scripts/{ => _internal}/eval_star_predcls.sh                     |   26 [32m+[m[31m-[m
+ scripts/{ => _internal}/eval_star_sgcls.sh                       |   25 [32m+[m[31m-[m
+ scripts/{ => _internal}/eval_star_sgdet.sh                       |   27 [32m+[m[31m-[m
+ scripts/{ => _internal}/run_star_experiment.sh                   |   48 [32m+[m[31m-[m
+ scripts/_internal/run_star_sgdet_experiment.sh                   |  105 [32m++[m
+ scripts/_internal/test_star_full.sh                              |   82 [32m+[m
+ scripts/_internal/train_star_full.sh                             |  110 [32m++[m
+ scripts/build_rsgp_structural_prior.sh                           |   22 [32m+[m
+ scripts/build_sgdet_detection_cache.sh                           |    6 [32m+[m[31m-[m
+ scripts/diagnose_star_object_classification.sh                   |   64 [31m-[m
+ scripts/eval_cross_task_minimal.sh                               |   70 [31m-[m
+ scripts/eval_predcls_minimal_ablation.sh                         |   73 [31m-[m
+ scripts/eval_predcls_rsgp_ablation.sh                            |   93 [31m--[m
+ scripts/research/README.md                                       |   21 [32m+[m
+ scripts/research/eval_paper_cross_task_suite.sh                  |   79 [32m+[m
+ scripts/research/eval_paper_predcls_suite.sh                     |   90 [32m++[m
+ scripts/research/eval_predcls_rsgp_ablation.sh                   |  116 [32m++[m
+ scripts/research/export_paper_qualitative_cases.sh               |  121 [32m++[m
+ scripts/research/run_paper_predcls_suite.sh                      |   80 [32m+[m
+ scripts/research/run_predcls_minimal_ablation.sh                 |  163 [32m++[m
+ scripts/research/run_star_sgcls_experiment.sh                    |   63 [32m+[m
+ scripts/research/run_star_sgdet_rpcm_budget.sh                   |   14 [32m+[m
+ scripts/research/select_predcls_rsgp_on_val.sh                   |   14 [32m+[m
+ scripts/run_predcls_minimal_ablation.sh                          |   55 [31m-[m
+ scripts/run_star_sgcls_experiment.sh                             |   18 [31m-[m
+ scripts/run_star_sgdet_experiment.sh                             |   36 [31m-[m
+ scripts/run_star_tail_aux.sh                                     |   46 [31m-[m
+ scripts/smoke_test_clean_env.sh                                  |   18 [32m+[m[31m-[m
+ scripts/test_star_predcls_full.sh                                |    4 [32m+[m
+ scripts/test_star_sgcls_full.sh                                  |    4 [32m+[m
+ scripts/test_star_sgdet_full.sh                                  |    4 [32m+[m
+ scripts/train_star_predcls_full.sh                               |    4 [32m+[m
+ scripts/train_star_sgcls_full.sh                                 |    4 [32m+[m
+ scripts/train_star_sgdet_full.sh                                 |    4 [32m+[m
+ sgg/config/defaults.py                                           |   55 [32m+[m[31m-[m
+ sgg/data/build.py                                                |   73 [32m+[m[31m-[m
+ sgg/data/datasets/star.py                                        |    2 [32m+[m[31m-[m
+ sgg/data/grouped_batch_sampler.py                                |   58 [32m+[m
+ sgg/data/rsgp_statistics.py                                      |  393 [32m+++++[m
+ sgg/data/sources/star.py                                         |    6 [32m+[m[31m-[m
+ sgg/data/transforms/__init__.py                                  |    2 [32m+[m
+ sgg/data/transforms/common.py                                    |   39 [32m+[m[31m-[m
+ sgg/engine/trainer.py                                            |  560 [32m++++++[m[31m-[m
+ sgg/evaluation/sgg_eval.py                                       |  178 [32m++[m[31m-[m
+ sgg/modeling/detectors/scene_graph_detector.py                   |    2 [32m+[m[31m-[m
+ sgg/modeling/roi_heads/relation_head.py                          |   88 [32m+[m[31m-[m
+ sgg/modeling/roi_heads/roi_relation_predictors.py                | 1022 [32m++++++++++++[m[31m-[m
+ sgg/modeling/roi_heads/rsgp.py                                   |  429 [32m+++++[m[31m-[m
+ sgg/utils/reproducibility.py                                     |   42 [32m+[m
+ tests/test_candidate_graph_statistics.py                         |   27 [32m+[m
+ tests/test_dual_la_task_configs.py                               |  230 [32m+++[m
+ tests/test_extract_paper_supplement.py                           |  100 [32m++[m
+ tests/test_qualitative_case_export.py                            |  317 [32m++++[m
+ tests/test_rpcm_input_compat.py                                  |   93 [32m++[m
+ tests/test_rpcm_sgg_toolkit_gnn.py                               |  382 [32m++++[m[31m-[m
+ tests/test_rsgp_statistical_roles.py                             |  287 [32m++++[m
+ tests/test_trainer_early_stopping.py                             |  194 [32m+++[m
+ tools/build_rsgp_structural_prior.py                             |   82 [32m+[m
+ tools/build_sgdet_detection_cache.py                             |    2 [32m+[m[31m-[m
+ tools/check_environment.py                                       |   97 [32m++[m
+ tools/convert_rpcm_6850_to_dual.py                               |  182 [32m+++[m
+ tools/eval_once.py                                               |  180 [32m++[m[31m-[m
+ tools/extract_paper_supplement.py                                |  661 [32m++++++++[m
+ tools/migrate_sgdet_detection_cache.py                           |    2 [32m+[m[31m-[m
+ tools/render_qualitative_cases.py                                |  795 [32m++++++++++[m
+ tools/render_spatial_scene_graph_cases.py                        | 1428 [32m+++++++++++++++++[m
+ tools/summarize_paper_experiments.py                             |  148 [32m++[m
+ tools/train_pair_proposal_network.py                             |   11 [32m+[m[31m-[m
+ train.py                                                         |   78 [32m+[m
+ 107 files changed, 16361 insertions(+), 2065 deletions(-)
