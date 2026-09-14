@@ -1,7 +1,7 @@
 """Evaluate one checkpoint on one split without hidden experiment defaults.
 
-The shell wrappers ``eval_star_{predcls,sgcls,sgdet}.sh`` provide task-specific
-defaults.  This lower-level entry intentionally requires config/checkpoint and
+The shell wrappers ``eval_barc_{predcls,sgcls,sgdet}.sh`` provide task-specific
+BARC defaults. This lower-level entry intentionally requires config/checkpoint and
 supports ``--max-images`` for deterministic smoke tests.
 """
 

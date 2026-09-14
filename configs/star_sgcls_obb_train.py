@@ -13,7 +13,8 @@ The last item affects only candidate pairs from Semantic Filter/PPG/PPN/RSGP;
 it does not write GT labels into the final object predictions. Set
 SGCLS_FILTER_LABEL_SOURCE=pred for a strict fully predicted-label ablation.
 
-Typical launch command: bash scripts/run_star_sgcls_experiment.sh
+This file is an internal task-base configuration; use
+`configs/star_barc_sgcls.py` as the public entry point.
 """
 
 from __future__ import annotations

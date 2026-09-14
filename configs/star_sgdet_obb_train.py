@@ -15,9 +15,9 @@ The same cache can therefore switch between matched_gt and pred label
 protocols. A hash or version mismatch raises an error instead of silently
 falling back to the slow detector.
 
-Typical workflow:
+Public BARC workflow:
     bash scripts/build_sgdet_detection_cache.sh
-    bash scripts/run_star_sgdet_experiment.sh
+    bash scripts/run_barc_sgdet.sh
 """
 
 from __future__ import annotations

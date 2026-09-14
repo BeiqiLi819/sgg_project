@@ -1,22 +1,29 @@
-# STAR OBB Scene Graph Generation
+# BARC-SGG
 
-This directory is the minimal release tree for the STAR oriented-bounding-box
-(OBB) scene-graph-generation implementation. It contains the runnable model,
-STAR data adapter, training/evaluation entry points, three task configurations,
-and a small compatibility test set.
+Budget-Aware, Role-structured and Calibrated Scene Graph Generation for
+large-scale remote-sensing imagery.
 
-## Supported tasks
+This is the minimal public release tree for BARC-SGG. The default pipeline is
+organized around the three method components:
 
-| Task | Boxes | Object labels | Predicates |
-|---|---|---|---|
-| PredCls | annotated OBBs | annotated labels | predicted |
-| SGCls | annotated OBBs | predicted | predicted |
-| SGDet | predicted OBBs | predicted | predicted |
+1. **BAP** — whole-image budget-aware pair proposal using a target-free
+   residual over the released PPG score;
+2. **Dual Role-aware RPCM** — separate shared-subject and shared-object
+   relation propagation;
+3. **BAC** — base-anchored predicate recalibration with an all-class residual
+   and a frozen-validation hard-predicate auxiliary branch.
 
-The relation stack includes the RPCM-compatible predictor, PPG/PPN/RSGP pair
-proposal filters, OBB geometry utilities, and STAR evaluation. Research-only
-diagnostics, paper artifacts, experiment sweeps, generated outputs, and local
-checkpoints are intentionally not part of this release tree.
+## Tasks
+
+| Task | Configuration |
+|---|---|
+| PredCls | `configs/star_barc_predcls.py` |
+| SGCls | `configs/star_barc_sgcls.py` |
+| SGDet | `configs/star_barc_sgdet.py` |
+
+The `sgg/` package contains the BARC runtime and compatible STAR OBB relation
+components. Generic STAR task configs are kept only as inheritance bases;
+BARC configs are the public entry points.
 
 ## Installation
 
@@ -30,11 +37,7 @@ conda activate sgg
 python tools/check_environment.py --strict --require-cuda
 ```
 
-PyTorch, CUDA, and MMCV must be installed with mutually compatible versions.
-The installer builds MMCV with CUDA operators when no compatible wheel is
-provided.
-
-## Data and optional artifacts
+## Data and external artifacts
 
 Set the STAR dataset root:
 
@@ -42,63 +45,68 @@ Set the STAR dataset root:
 export STAR_SGG_ROOT=/path/to/STAR_SGG
 ```
 
-The expected dataset files are documented in
-[`docs/data_and_checkpoints.md`](docs/data_and_checkpoints.md). Dataset files,
-GloVe embeddings, detector checkpoints, relation checkpoints, and SGDet
-detection caches must be obtained separately under their applicable licenses;
-none are redistributed here.
+STAR images/annotations, GloVe embeddings, the released PPG checkpoint, the
+Dual RPCM base checkpoint, and trained BAP/BAC checkpoints are not bundled.
+See [`docs/data_and_checkpoints.md`](docs/data_and_checkpoints.md) for the
+expected paths and artifact boundaries.
 
-The small semantic-support metadata file is included at
-`pretrained/SF_list_support.json`. The binary files referenced by the configs
-are external artifacts.
+The lightweight, TEST-free BARC hard-predicate manifest is included at
+`pretrained/BARC_hard_predicates_top20.json`.
 
-## Training
+## BARC evaluation
 
-```bash
-# PredCls
-bash scripts/run_star_experiment.sh
-
-# SGCls
-bash scripts/run_star_sgcls_experiment.sh
-
-# SGDet: build the frozen detector cache first
-bash scripts/build_sgdet_detection_cache.sh
-bash scripts/run_star_sgdet_experiment.sh
-```
-
-Use `CONFIG`, `OUTPUT_DIR`, `DEVICE`, `RESUME`, and the task-specific
-environment variables to override defaults. Training outputs are written below
-`outputs/`, which is ignored by Git.
-
-## Evaluation
+Provide a combined BARC checkpoint and the trained BAP proposal checkpoint:
 
 ```bash
-bash scripts/eval_star_predcls.sh
-bash scripts/eval_star_sgcls.sh
-bash scripts/eval_star_sgdet.sh
-```
-
-For an explicit run, use the lower-level entry point:
-
-```bash
-CONFIG=configs/star_predcls_obb_train.py \
-CHECKPOINT=/path/to/checkpoint.pth \
-OUTPUT_DIR=outputs/eval \
+CONFIG=configs/star_barc_predcls.py \
+CHECKPOINT=/path/to/barc_predcls.pth \
+BARC_BAP_CHECKPOINT=/path/to/barc_bap.pth \
+OUTPUT_DIR=outputs/barc_predcls_eval \
   bash scripts/eval_once.sh
 ```
+
+For task wrappers:
+
+```bash
+bash scripts/eval_barc_predcls.sh
+bash scripts/eval_barc_sgcls.sh
+bash scripts/eval_barc_sgdet.sh
+```
+
+SGDet requires a compatible frozen-detector cache before evaluation.
+
+## BARC training stages
+
+The method-specific tools are named after their BARC stage:
+
+```bash
+# Build target-free BAP context metadata and train the BAP residual.
+python tools/build_barc_bap_context.py --help
+python tools/train_barc_bap.py --help
+python tools/export_barc_bap_pairs.py --help
+
+# Export cached BAC features and train proposal-consistent BAC.
+python tools/export_barc_bac_cache.py --help
+python tools/train_barc_bac.py --help
+```
+
+These stages require external STAR data, compatible base checkpoints, and
+their corresponding intermediate caches. Unannotated pairs are not treated as
+background negatives in BAP/BAC.
 
 ## Tests
 
 ```bash
-pytest -q tests
+python -m pytest -q tests
 ```
 
-The included tests focus on OBB detector compatibility, classifier-channel
-ordering, and RPCM graph behavior. Full-data smoke tests require the STAR data
-root and applicable checkpoints.
+The included tests cover core OBB/RPCM compatibility and run without external
+weights; tests that inspect the released detector checkpoint are skipped when
+that optional artifact is absent.
 
-## License and third-party components
+## Release boundary
 
-This release tree does not yet declare a project license. Add the intended
-license before public distribution. STAR, PyTorch, MMCV, torchvision, and any
-external pretrained weights retain their respective licenses and terms.
+This tree intentionally excludes experiment outputs, paper figures, internal
+research-round diagnostics, local caches, and binary model weights. Add the
+project's chosen license before public distribution, and comply with the
+licenses of STAR, PyTorch, MMCV, torchvision, GloVe, and all external weights.

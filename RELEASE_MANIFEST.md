@@ -4,11 +4,12 @@ Included:
 
 - `sgg/`: runnable STAR OBB SGG runtime and model implementation;
 - `train.py`: training entry point;
-- `tools/`: environment check, evaluation, detector-cache build, and checkpoint
+- `tools/`: BAP context/training/export stages, BAC cache/training stages,
+  environment check, evaluation, detector-cache build, and checkpoint
   class-order migration;
-- `configs/`: base PredCls/SGCls/SGDet configs and their required inheritance
-  chain;
-- `scripts/`: clean environment setup and task launch/evaluation wrappers;
+- `configs/`: BARC PredCls/SGCls/SGDet entry points and their small STAR base
+  inheritance chain;
+- `scripts/`: clean environment setup and BARC task launch/evaluation wrappers;
 - `tests/`: small dependency-light compatibility and model smoke tests;
 - lightweight metadata and dependency documentation.
 
@@ -18,7 +19,7 @@ Intentionally excluded:
 - detector/relation checkpoints and SGDet caches;
 - `outputs/`, `outputs_old/`, logs, experiment results, and paper figures;
 - research-round diagnostics, ablation sweeps, downstream studies, and
-  internal scripts;
+  non-BARC internal scripts;
 - local editor, agent, and environment state.
 
 The parent research workspace is unchanged. Publish the contents of this

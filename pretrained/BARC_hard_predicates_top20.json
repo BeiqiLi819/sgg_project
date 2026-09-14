@@ -1,0 +1,155 @@
+{
+  "schema": "barc-rule-generated-hard-predicates-v1",
+  "dataset": "STAR",
+  "background_predicate_id": 0,
+  "selection_rule": "B_recall",
+  "selection_definition": "Bottom-K beta(1,1)-smoothed frozen-Dual VAL Recall@2000; predicate-id tie break",
+  "hard_count": 20,
+  "source_manifest": "STAR validation-only hard-predicate selection manifest",
+  "source_manifest_sha256": "b38762b787a2c4a60615bedede7c2349ab85c896a7adda1c3868443598a486b8",
+  "test_statistics_used": false,
+  "recalibration_results_used": false,
+  "predicates": [
+    {
+      "id": 14,
+      "name": "randomly parked on",
+      "rank": 1,
+      "smoothed_val_recall": 0.014477110745614035,
+      "val_support": 510
+    },
+    {
+      "id": 36,
+      "name": "not docked alongside with",
+      "rank": 2,
+      "smoothed_val_recall": 0.01587598834789846,
+      "val_support": 265
+    },
+    {
+      "id": 24,
+      "name": "not parked alongside with",
+      "rank": 3,
+      "smoothed_val_recall": 0.022344116999106645,
+      "val_support": 572
+    },
+    {
+      "id": 20,
+      "name": "not run along",
+      "rank": 4,
+      "smoothed_val_recall": 0.022727272727272728,
+      "val_support": 42
+    },
+    {
+      "id": 28,
+      "name": "running along the same taxiway with",
+      "rank": 5,
+      "smoothed_val_recall": 0.02564102564102564,
+      "val_support": 37
+    },
+    {
+      "id": 25,
+      "name": "running along the different taxiway with",
+      "rank": 6,
+      "smoothed_val_recall": 0.03538812785388128,
+      "val_support": 144
+    },
+    {
+      "id": 39,
+      "name": "driving in the same lane with",
+      "rank": 7,
+      "smoothed_val_recall": 0.0525801026467279,
+      "val_support": 1971
+    },
+    {
+      "id": 58,
+      "name": "not working on",
+      "rank": 8,
+      "smoothed_val_recall": 0.05263157894736842,
+      "val_support": 17
+    },
+    {
+      "id": 7,
+      "name": "randomly docked at",
+      "rank": 9,
+      "smoothed_val_recall": 0.0708120708120708,
+      "val_support": 109
+    },
+    {
+      "id": 9,
+      "name": "docked alongside with",
+      "rank": 10,
+      "smoothed_val_recall": 0.11296698328497835,
+      "val_support": 917
+    },
+    {
+      "id": 32,
+      "name": "running along the different runway with",
+      "rank": 11,
+      "smoothed_val_recall": 0.125,
+      "val_support": 6
+    },
+    {
+      "id": 56,
+      "name": "indirectly transmit electricity to",
+      "rank": 12,
+      "smoothed_val_recall": 0.12580645161290324,
+      "val_support": 29
+    },
+    {
+      "id": 38,
+      "name": "driving in the different lane with",
+      "rank": 13,
+      "smoothed_val_recall": 0.13083775988119453,
+      "val_support": 1843
+    },
+    {
+      "id": 30,
+      "name": "away from",
+      "rank": 14,
+      "smoothed_val_recall": 0.13683677001434008,
+      "val_support": 319
+    },
+    {
+      "id": 31,
+      "name": "within danger distance of",
+      "rank": 15,
+      "smoothed_val_recall": 0.1413499751614506,
+      "val_support": 669
+    },
+    {
+      "id": 41,
+      "name": "driving alongside with",
+      "rank": 16,
+      "smoothed_val_recall": 0.1534825870646766,
+      "val_support": 199
+    },
+    {
+      "id": 48,
+      "name": "drive off",
+      "rank": 17,
+      "smoothed_val_recall": 0.15936285936285935,
+      "val_support": 64
+    },
+    {
+      "id": 11,
+      "name": "driving in the same direction with",
+      "rank": 18,
+      "smoothed_val_recall": 0.19010473370291467,
+      "val_support": 3592
+    },
+    {
+      "id": 34,
+      "name": "in the same parking with",
+      "rank": 19,
+      "smoothed_val_recall": 0.21099767522744795,
+      "val_support": 4482
+    },
+    {
+      "id": 53,
+      "name": "indirectly connected to",
+      "rank": 20,
+      "smoothed_val_recall": 0.22454780361757104,
+      "val_support": 41
+    }
+  ],
+  "content_hash": "7ac8b3573cba858ca061c0fbf2f64e5a01a28263c52971e801c6e6e753fab9e4"
+}

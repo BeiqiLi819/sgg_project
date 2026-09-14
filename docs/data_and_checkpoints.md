@@ -16,11 +16,16 @@ pretrained/OBB_swin_L_OBD.pth   frozen OBB detector
 pretrained/STAR_OBB.pth         STAR PPG checkpoint
 pretrained/PPN_OBB.pth          optional PPN checkpoint
 glove/glove.6B.200d.txt         relation semantic initialization
+pretrained/BARC_BAP.pth         trained BAP residual checkpoint
+pretrained/BARC_BAC.pth         optional standalone BAC checkpoint
 ```
 
 Place compatible files at those paths or override the paths through the
-configuration/environment variables. SGDet additionally requires a generated
-cache when `SGDET_DETECTION_CACHE_ENABLED=1`.
+configuration/environment variables. The public BARC configs use
+`BARC_BAP_CHECKPOINT` and `BARC_HARD_PREDICATE_MANIFEST`. The combined BARC
+relation checkpoint is passed to `tools/eval_once.py` through `--checkpoint`.
+SGDet additionally requires a generated cache when
+`SGDET_DETECTION_CACHE_ENABLED=1`.
 
 The included `pretrained/SF_list_support.json` is metadata only; it is not a
 model checkpoint.
