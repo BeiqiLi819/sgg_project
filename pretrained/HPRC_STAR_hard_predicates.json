@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "dataset": "STAR",
+  "background_predicate_id": 0,
+  "selection_source": "historical_6850_development_difficulty_audit",
+  "selection_inputs": [
+    "training predicate frequency",
+    "frozen-6850 development recall",
+    "persistent semantic confusion"
+  ],
+  "test_statistics_used": false,
+  "predicates": [
+    {"id": 7, "name": "randomly docked at"},
+    {"id": 14, "name": "randomly parked on"},
+    {"id": 20, "name": "not run along"},
+    {"id": 24, "name": "not parked alongside with"},
+    {"id": 25, "name": "running along the different taxiway with"},
+    {"id": 28, "name": "running along the same taxiway with"},
+    {"id": 31, "name": "within danger distance of"},
+    {"id": 33, "name": "incorrectly parked on"},
+    {"id": 36, "name": "not docked alongside with"},
+    {"id": 38, "name": "driving in the different lane with"},
+    {"id": 39, "name": "driving in the same lane with"},
+    {"id": 41, "name": "driving alongside with"},
+    {"id": 53, "name": "indirectly connected to"},
+    {"id": 56, "name": "indirectly transmit electricity to"},
+    {"id": 58, "name": "not working on"}
+  ],
+  "notes": [
+    "This is a frozen compatibility manifest for the successful historical HPRC checkpoint lineage.",
+    "A future re-selection must be derived once from frozen-6850 TRAIN predictions and saved under a new hash/version."
+  ]
+}

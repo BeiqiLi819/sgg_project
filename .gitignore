@@ -1,0 +1,88 @@
+# ---------------------------------------------------------------------------
+# Python bytecode, build products, and environments
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+build/
+dist/
+*.egg-info/
+.eggs/
+
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Tests, notebooks, linters, and editors
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# Runtime outputs
+# ---------------------------------------------------------------------------
+/outputs/
+/runs/
+/logs/
+/wandb/
+/tensorboard/
+
+*.log
+nohup.out
+*.pid
+exit_code.txt
+cmdlines.txt
+
+# ---------------------------------------------------------------------------
+# Local datasets, embeddings, checkpoints, and generated caches
+# ---------------------------------------------------------------------------
+/data/
+/datasets/
+/toy_data/
+/glove/
+/checkpoints/
+/weights/
+
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+
+# Keep small JSON metadata under pretrained/ trackable. The global weight
+# patterns above exclude only binary model files.
+
+# ---------------------------------------------------------------------------
+# Generated diagnostics and local reference material
+# ---------------------------------------------------------------------------
+predicate_confusion_*.png
+test_gt_pair_coverage_*.json
+top_mistaken_predicates_*.json
+diag_*.json
+
+/Star A first-ever dataset and a large-scale benchmark for scene graph generation in large-size satellite imagery.pdf
+
+# ---------------------------------------------------------------------------
+# Local Codex/agent state
+# ---------------------------------------------------------------------------
+.agents/
+.codex
+.codex/
